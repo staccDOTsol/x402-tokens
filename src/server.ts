@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
 import { complete, listModels } from "./openrouter.js";
 import { clankerPrompt, renderIndex } from "./page.js";
-import { quoteLive, quoteMediaLive } from "./quote.js";
+import { quoteLive, quoteMediaLive, quoteUnits } from "./quote.js";
 import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, submitVideo, unitCostUsd } from "./together.js";
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
@@ -566,6 +566,70 @@ export function createServerFor(cfg: Config) {
 
     // "The body never ships twice": bind a corpus once, then ask with
     // X-HRR-Context on small bodies. Free — see bindPassthrough for why.
+    // PREPAY. Settling on-chain per call is where the latency actually lives:
+    // this gateway answers its 402 challenge in ~0.12s, while a full paid call
+    // MEASURED 9-37s end to end, almost all of it the payment round trip.
+    // Credit is already spent automatically wherever a quote is priced, but
+    // nothing could ever ADD credit except an error refund. Buying it in one
+    // settlement lets every later call skip verify+settle entirely.
+    if (req.method === "GET" && url.pathname === "/v1/credits") {
+      return json(res, 200, { balanceUsd: creditBalance(tenantFor(cfg, req)) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/credits/topup") {
+      const raw = await readBody(req);
+      let body: { usd?: unknown };
+      try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
+      const usd = Number(body.usd);
+      if (!Number.isFinite(usd) || usd < 1 || usd > 500) {
+        return json(res, 400, { error: "usd must be a number between 1 and 500" });
+      }
+      const tenantKey = tenantFor(cfg, req);
+      // Credit is keyed by TENANT, and an unsigned request resolves to the
+      // shared one — topping that up would hand the balance to every other
+      // unsigned caller on the gateway. A proven namespace is mandatory here
+      // even while it stays optional elsewhere.
+      if (tenantKey === cfg.lecoreTenant) {
+        return json(res, 403, {
+          error: "credits require a signed namespace",
+          detail: "send x-openzoo-namespace with -sig / -signer / -ts (openzoo >= 0.44.0 does this automatically)",
+        });
+      }
+      // billedUsd = upstreamUsd * markup, so divide it back out: credit is sold
+      // at FACE VALUE. The markup is already taken on the calls it pays for,
+      // and charging it twice would make prepaying strictly worse than not.
+      const q = quoteUnits(cfg, "credit", usd / cfg.markup, "prepay");
+      const resource = `${cfg.publicUrl}/v1/credits/topup`;
+      const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
+      const evt = (status: string, extra: Record<string, unknown> = {}) =>
+        logEvent({ path: url.pathname, status, ip, ...extra });
+
+      const header = req.headers["x-payment"] as string | undefined;
+      if (!header) {
+        evt("402_quoted", { billedUsd: q.billedUsd, topupUsd: usd });
+        return json(res, 402, challenge(cfg, q, resource), { "x-402-priced-at": q.pricedAt });
+      }
+      const v = await verify(cfg, header, requirements(cfg, q, resource));
+      if (!v.ok || !v.picked) {
+        evt("402_invalid", { reason: (v.reason ?? "invalid payment").slice(0, 200) });
+        return json(res, 402, challenge(cfg, q, resource, v.reason ?? "invalid payment"));
+      }
+      const settled = await settle(cfg, header, v.picked)
+        .catch((e) => ({ success: false, errorReason: (e as Error).message })) as
+        { success?: boolean; errorReason?: string; transaction?: string; payer?: string };
+      if (!settled.success) {
+        const reason = (settled.errorReason ?? "settle failed").slice(0, 300);
+        evt("failed_settle", { reason, topupUsd: usd });
+        return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`));
+      }
+      // Grant only AFTER settlement succeeds — never on the strength of a
+      // payment header alone.
+      grantCredit(tenantKey, usd, "prepay");
+      const balanceUsd = creditBalance(tenantKey);
+      evt("topup_ok", { topupUsd: usd, balanceUsd, tx: settled.transaction });
+      return json(res, 200, { ok: true, creditedUsd: usd, balanceUsd, tx: settled.transaction });
+    }
+
     if (req.method === "POST" && url.pathname === "/v1/hrr/bind") {
       const raw = await readBody(req);
       let body: Record<string, unknown>;
