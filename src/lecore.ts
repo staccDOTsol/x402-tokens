@@ -38,6 +38,9 @@ export interface LecoreResult {
     spilledTokens?: number;
     /** attach only: how many passages recall returned. */
     recalled?: number;
+    /** attach only: tokens in the WHOLE bound corpus — the counterfactual
+     *  basis, i.e. what the caller would have had to send without leCore. */
+    corpusTokens?: number;
   };
 }
 
@@ -398,15 +401,27 @@ export async function attach(
       cfg.lecoreTimeoutMs, cfg.lecoreKey);
     if (status === 404) throw new ContextGoneError(contextId);
     if (status < 200 || status >= 300) throw new Error(`recall -> ${status}`);
-    const items = ((rec as { items?: Array<{ text?: string }> })?.items ?? []);
+    const r = rec as { items?: Array<{ text?: string }>; chunks?: number; corpus_chars?: number | null };
+    const items = (r?.items ?? []);
     const slice = items.map((x) => x?.text ?? "").filter(Boolean).join("\n---\n");
     const rebuilt: Msg[] = slice
-      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote(items.length, cfg.lecoreCorpusChunks)}` }, ...msgs]
+      ? [{ role: "system", content: `Relevant earlier context, retrieved from holographic memory:\n${slice}${coverageNote(items.length, r?.chunks ?? cfg.lecoreCorpusChunks)}` }, ...msgs]
       : msgs;
     const after = estimateTokens(rebuilt);
+    // What answering this WITHOUT leCore would have cost: shipping the whole
+    // bound corpus. Prefer the sidecar's measured chars; fall back to chunk
+    // count × leCore's ~600-char chunk target when texts weren't hydrated.
+    const corpusTokens = Number.isFinite(r?.corpus_chars as number) && (r?.corpus_chars as number) > 0
+      ? Math.ceil((r!.corpus_chars as number) / 4)
+      : r?.chunks
+        ? Math.ceil((r.chunks * 600) / 4)
+        : undefined;
     return {
       body: { ...body, messages: rebuilt },
-      info: { engaged: true, mode: "attach", contextId, tokensBefore: before, tokensAfter: after, recalled: items.length },
+      info: {
+        engaged: true, mode: "attach", contextId, tokensBefore: before, tokensAfter: after,
+        recalled: items.length, corpusTokens,
+      },
     };
   } catch (e) {
     if (e instanceof ContextGoneError) throw e;

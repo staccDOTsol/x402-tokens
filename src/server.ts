@@ -748,7 +748,14 @@ export function createServerFor(cfg: Config) {
       const q = await quoteLive(
         shouldHaveEngaged ? { ...cfg, markup: 1 } : cfg,
         prepped,
-        lecoreInfo.engaged ? lecoreInfo.tokensBefore : undefined,
+        // ATTACH prices against the whole bound corpus, not tokensBefore. In
+        // attach the ask is tiny and the recalled slice is ADDED, so
+        // tokensBefore < what we forward and quote.ts's
+        // `counterfactualTokens > promptTokens` test could never pass —
+        // every attach call fell back to plain markup and reported a saving
+        // of exactly 1/markup. SPILL is unchanged: there tokensBefore IS the
+        // pre-compression body, which is the right counterfactual.
+        lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : undefined,
       );
       const reqs = requirements(cfg, q, resource);
       // one analytics line per chat request, whatever the outcome
@@ -901,6 +908,12 @@ export function createServerFor(cfg: Config) {
           pricing: q.pricing,
           directUsd: q.directUsd,
           savesVsDirect: q.savesVsDirect,
+          // OUR upstream cost. Clients were deriving it as billedUsd/markup,
+          // which is only right on a straight-markup call: under counterfactual
+          // pricing billedUsd is min(direct×discount, markupUsd), so that
+          // division understates cost and overstates margin. Report it instead
+          // of making every client re-derive it wrongly.
+          cogsUsd: q.openrouterUsd,
           markup: q.pricing === "markup" ? q.markup : undefined,
           paid: v.picked.asset,
           amount: v.picked.maxAmountRequired,
