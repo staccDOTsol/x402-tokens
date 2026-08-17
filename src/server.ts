@@ -11,6 +11,7 @@ import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, sub
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import { verifySignedNamespace } from "./nsauth.js";
+import { buildUnsignedPayment, type AcceptRow } from "./paybuild.js";
 import { applyCredit, creditBalance, grantCredit } from "./credits.js";
 import { dedupObserve } from "./dedup.js";
 import * as usage from "./usage.js";
@@ -382,6 +383,39 @@ export function createServerFor(cfg: Config) {
     // Stats WITH history. /v1/usage/summary is the live view; this is the one
     // a dashboard can plot, because daily rows are folded as events arrive and
     // persisted to the volume rather than reconstructed from a 10k ring.
+    // Build an UNSIGNED payment transaction for a caller that holds a wallet
+    // but cannot construct Solana transactions — a phone, a webview, an
+    // in-page burner. Free: it reads chain state and returns bytes, it moves
+    // nothing. The payer's key never comes near this process.
+    if (req.method === "POST" && url.pathname === "/v1/pay/build") {
+      const raw = await readBody(req);
+      let body: { accept?: AcceptRow; payer?: string };
+      try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
+      if (!body.accept || typeof body.payer !== "string") {
+        return json(res, 400, {
+          error: "pass { accept: <one accepts[] row from the 402>, payer: <base58 pubkey> }",
+        });
+      }
+      if (!String(body.accept.network || "").startsWith("solana:")) {
+        return json(res, 400, {
+          error: "only solana rows can be built here",
+          detail: "EVM rows are EIP-3009 signatures, not transactions — sign those client-side",
+        });
+      }
+      try {
+        const built = await buildUnsignedPayment(cfg.solanaRpc, body.accept, body.payer);
+        logEvent({ path: url.pathname, status: "pay_built" });
+        return json(res, 200, built);
+      } catch (e) {
+        // A bad pubkey or an unknown mint is the CALLER's error; an RPC that
+        // will not answer is ours. Both are 400-shaped to the client, but say
+        // which so a mobile dev is not left guessing.
+        const msg = (e as Error).message.slice(0, 200);
+        logEvent({ path: url.pathname, status: "pay_build_failed", reason: msg });
+        return json(res, 400, { error: "could not build payment", detail: msg });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/v1/stats") {
       const mine = usage.localSummary();
       const { results } = await usage.fanout<usage.Shard>("/v1/usage/local");

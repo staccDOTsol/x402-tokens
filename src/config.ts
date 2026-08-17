@@ -46,6 +46,7 @@ export interface Config {
   port: number;
   publicUrl: string;
   facilitator: string;
+  solanaRpc: string;
   network: string;
   payTo: string;
   /** Payee for every eip155 row. Separate from `payTo` because that one is a
@@ -256,6 +257,12 @@ export function loadConfig(): Config {
     port: Number(opt("PORT", "8787")),
     publicUrl: opt("PUBLIC_URL", "http://localhost:8787").replace(/\/$/, ""),
     facilitator: opt("X402_FACILITATOR", "https://x402.accrue.fund").replace(/\/$/, ""),
+    // Solana RPC — only used by /v1/pay/build, to read mint info (decimals +
+    // token program) and a recent blockhash. Settlement never touches it; the
+    // facilitator owns that. Public mainnet is fine for two cheap reads, and
+    // mint info is cached, but set SOLANA_RPC to a private endpoint if this
+    // ever gets hot.
+    solanaRpc: opt("SOLANA_RPC", "https://api.mainnet-beta.solana.com").replace(/\/$/, ""),
     network: opt("X402_NETWORK", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
     payTo: opt("X402_PAY_TO", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
     evmPayTo: EVM_PAY_TO,
