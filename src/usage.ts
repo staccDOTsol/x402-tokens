@@ -486,9 +486,36 @@ function blankDay(day: string): DayRow {
 }
 
 export function initDaily() {
-  if (!existsSync(DAILY_FILE)) return;
-  try { daily = JSON.parse(readFileSync(DAILY_FILE, "utf8")) as Record<string, DayRow>; }
-  catch { daily = {}; }   // a torn file loses history, never the server
+  if (existsSync(DAILY_FILE)) {
+    try { daily = JSON.parse(readFileSync(DAILY_FILE, "utf8")) as Record<string, DayRow>; }
+    catch { daily = {}; }   // a torn file loses history, never the server
+  }
+  // SEED FROM THE EVENT LOG, self-healingly. Rollups shipped after the event
+  // log already held real traffic, so a day counted only from the moment of
+  // deploy read 0 paid / $0 while that same day had genuinely settled calls.
+  // initUsage() has already replayed the persisted tail into the ring, so
+  // rebuild each day the ring covers and keep whichever row is HIGHER.
+  //
+  // Higher-wins matters: a stored row that was live-counted for a full day is
+  // more complete than the bounded ring, but a row created moments ago is not.
+  // The ring can never legitimately exceed a true total, so taking the max
+  // repairs the second case without corrupting the first. Recorded events
+  // only — nothing here is estimated.
+  if (ring.length) {
+    const fromRing: Record<string, DayRow> = {};
+    const target = daily;
+    daily = fromRing;
+    for (const e of ring) recordDaily(e);
+    daily = target;
+    for (const [day, ringRow] of Object.entries(fromRing)) {
+      const cur = daily[day];
+      if (!cur || ringRow.paid > cur.paid || ringRow.calls > cur.calls) {
+        (ringRow as DayRow & { seeded?: boolean }).seeded = true;
+        daily[day] = ringRow;
+        dailyDirty = true;
+      }
+    }
+  }
 }
 
 /** Fold one event into its day. Never throws — telemetry must not fail a request. */
@@ -547,6 +574,9 @@ function shapeDay(r: DayRow) {
     marginPct: r.usdPaid > 0 ? roundTo(((r.usdPaid - r.usdCogs) / r.usdPaid) * 100, 1) : null,
     lecoreSavingX: r.usdPaid > 0 ? roundTo(r.usdDirect / r.usdPaid, 2) : null,
     conversionPct: r.paid + quoted > 0 ? roundTo((r.paid / (r.paid + quoted)) * 100, 1) : null,
+    // true when this day was reconstructed from the bounded event ring at boot
+    // rather than counted live — the totals are a floor, not a full day.
+    partial: (r as DayRow & { seeded?: boolean }).seeded === true || undefined,
   };
 }
 

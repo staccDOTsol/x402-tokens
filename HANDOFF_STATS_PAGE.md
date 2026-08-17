@@ -35,7 +35,8 @@ Response:
     "distinctPayers": 3,
     "marginPct": 64.0,
     "lecoreSavingX": 53.2,     // usdDirect / usdPaid
-    "conversionPct": 4.5       // paid / (paid + quoted_not_paid)
+    "conversionPct": 4.5,      // paid / (paid + quoted_not_paid)
+    "partial": true            // OPTIONAL, see below
   },
 
   "days": [                    // one row per UTC day, oldest first
@@ -58,6 +59,15 @@ Response:
 All percentages are numbers already computed server-side — do not recompute
 margin or the saving multiple in the browser, so the site and the in-app HUD
 cannot disagree.
+
+### `partial: true`
+
+A day carries `partial: true` when it was rebuilt from the bounded event ring
+at boot rather than counted live from midnight. The numbers are **real recorded
+events**, but the ring holds at most 10,000, so a partial day is a **floor, not
+a full total**. Render a quiet marker on that day (e.g. "partial — rebuilt from
+the event log"); do not hide it and do not treat it as an error. Days counted
+live have no `partial` field at all.
 
 `growth.*` fields are **percent change**, and are `null` (not `0`) when there
 is not enough history. Render "collecting" for null, never a zero or a flat
