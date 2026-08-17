@@ -261,6 +261,33 @@ export function createServerFor(cfg: Config) {
   const handler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", cfg.publicUrl);
 
+    // CORS. A browser or webview client — the Cordova/Seeker shell, or any
+    // in-page x402 payer — cannot call this API without it: the preflight is
+    // rejected before the real request is ever sent. There is nothing to
+    // protect by withholding it, because this gateway has no cookies and no
+    // ambient session: every paid call is authorised by an x402 signature and
+    // every tenant by a signed namespace, both of which the caller must
+    // present explicitly. Same-origin policy was never the boundary here.
+    //
+    // x-payment / x-hrr-context / the namespace headers must be allowed
+    // explicitly — they are not CORS-safelisted — and x-payment-response must
+    // be EXPOSED or the client cannot read its own settlement receipt.
+    const origin = (req.headers.origin as string | undefined) ?? "*";
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("vary", "origin");
+    res.setHeader("access-control-allow-headers",
+      "content-type, authorization, x-payment, x-hrr-context, x-hrr-top-k, x-hrr-gate, "
+      + "x-openzoo-namespace, x-openzoo-namespace-sig, x-openzoo-namespace-signer, "
+      + "x-openzoo-namespace-ts, x-openzoo-namespace-chain");
+    res.setHeader("access-control-expose-headers", "x-payment-response, x-402-priced-at");
+    res.setHeader("access-control-max-age", "86400");
+    if (req.method === "OPTIONS") {
+      res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       const html = renderIndex(cfg);
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) });
@@ -350,6 +377,16 @@ export function createServerFor(cfg: Config) {
           auth: "unauthenticated: keyed on a public Solana address, so anyone who knows the address can read these rows. No IPs, bodies or prompts are returned.",
         }),
       });
+    }
+
+    // Stats WITH history. /v1/usage/summary is the live view; this is the one
+    // a dashboard can plot, because daily rows are folded as events arrive and
+    // persisted to the volume rather than reconstructed from a 10k ring.
+    if (req.method === "GET" && url.pathname === "/v1/stats") {
+      const mine = usage.localSummary();
+      const { results } = await usage.fanout<usage.Shard>("/v1/usage/local");
+      const merged = usage.mergeShards([mine, ...results]) as { topModels?: { model: string; calls: number }[] };
+      return json(res, 200, usage.statsPayload(merged.topModels ?? []));
     }
 
     if (req.method === "GET" && url.pathname === "/v1/usage/summary") {
@@ -999,6 +1036,13 @@ export function createServerFor(cfg: Config) {
     handler,
     listen(port = cfg.port) {
       usage.initUsage(); // notices the volume (if any) and replays its tail into the ring
+      usage.initDaily();  // load persisted daily rollups so history survives deploys
+      // Batch the rollup write instead of one whole-file write per event.
+      // unref'd so it can never hold the process open by itself.
+      setInterval(() => usage.flushDaily(), 10_000).unref();
+      for (const sig of ["SIGTERM", "SIGINT"] as const) {
+        process.once(sig, () => { usage.flushDaily(); process.exit(0); });
+      }
       const s = createServer((req, res) => {
         handler(req, res).catch((e) => json(res, 500, { error: (e as Error).message.slice(0, 160) }));
       });

@@ -20,6 +20,12 @@ primary_region = "iad"
   destination = "/data"
 
 [[vm]]
-  cpu_kind = "shared"
-  cpus = 1
-  memory_mb = 256
+  # Deliberately big, and deliberately ONE machine: the credit ledger in
+  # src/credits.ts is machine-local (a file plus an in-memory Map), so with two
+  # machines a prepaid balance was visible to roughly half of requests —
+  # MEASURED as a balance alternating $2.99 / $0.00 across consecutive reads.
+  # Until credit lives in a shared store, count must stay 1, which means the
+  # single machine has to be able to carry the whole load.
+  cpu_kind = "performance"
+  cpus = 16
+  memory_mb = 32768

@@ -24,7 +24,7 @@
  *   on-chain; it is stored in full so a payer can look themselves up, while
  *   the console log line keeps the 8-char form it always had.
  */
-import { appendFileSync, closeSync, existsSync, openSync, readSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { resolve6 } from "node:dns/promises";
 
 export type UsageEvent = {
@@ -124,6 +124,7 @@ function rotateIfBig() {
 export function record(e: UsageEvent) {
   try {
     pushRing(e);
+    recordDaily(e);
     if (!persisted) return;
     const line = JSON.stringify(e) + "\n";
     appendFileSync(FILE, line);
@@ -448,3 +449,150 @@ export function mergeShards(shards: Shard[]) {
 }
 
 export const usageRingSize = () => ring.length;
+
+/* ------------------------------------------------------------------------- *
+ * DAILY ROLLUPS
+ *
+ * The event ring holds 10,000 events — MEASURED at one point as a 1h39m
+ * window — and `today` resets at UTC midnight, so nothing here could answer
+ * "how did last week go". A stats page built on the raw endpoint would have
+ * had to snapshot it from outside and hope. Instead we fold each day into a
+ * durable row as it happens: small, append-safe, and it survives restarts and
+ * deploys on the same volume the event log already uses.
+ * ------------------------------------------------------------------------- */
+
+const DAILY_FILE = `${DIR}/usage_daily.json`;
+
+export type DayRow = {
+  day: string;
+  calls: number;
+  paid: number;
+  free: number;
+  quoted_not_paid: number;
+  failed_settle: number;
+  usdPaid: number;
+  usdCogs: number;
+  usdDirect: number;
+  /** 8-char payer prefixes seen that day; a Set on disk would not round-trip */
+  payers: string[];
+};
+
+let daily: Record<string, DayRow> = {};
+let dailyDirty = false;
+
+function blankDay(day: string): DayRow {
+  return { day, calls: 0, paid: 0, free: 0, quoted_not_paid: 0, failed_settle: 0,
+    usdPaid: 0, usdCogs: 0, usdDirect: 0, payers: [] };
+}
+
+export function initDaily() {
+  if (!existsSync(DAILY_FILE)) return;
+  try { daily = JSON.parse(readFileSync(DAILY_FILE, "utf8")) as Record<string, DayRow>; }
+  catch { daily = {}; }   // a torn file loses history, never the server
+}
+
+/** Fold one event into its day. Never throws — telemetry must not fail a request. */
+export function recordDaily(e: UsageEvent) {
+  try {
+    const day = String(e.ts).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    const row = (daily[day] ||= blankDay(day));
+    row.calls += 1;
+    const status = e.status || "unknown";
+    if (status === "free") row.free += 1;
+    if (status === "402_quoted") row.quoted_not_paid += 1;
+    if (status === "failed_settle") row.failed_settle += 1;
+    if (PAID.has(status)) {
+      row.paid += 1;
+      row.usdPaid += Number(e.billedUsd) || 0;
+      row.usdCogs += Number((e as { cogsUsd?: number }).cogsUsd) || 0;
+      row.usdDirect += Number((e as { directUsd?: number }).directUsd) || 0;
+    }
+    if (e.payer) {
+      const p = e.payer.slice(0, 8);
+      if (!row.payers.includes(p)) row.payers.push(p);
+    }
+    dailyDirty = true;
+  } catch { /* never fail a request over stats */ }
+}
+
+/** Flush at most once per interval — one small whole-file write, not per event. */
+export function flushDaily() {
+  if (!dailyDirty || !persisted) return;
+  try {
+    writeFileSync(DAILY_FILE, JSON.stringify(daily));
+    dailyDirty = false;
+  } catch { /* disk trouble must not take down serving */ }
+}
+
+const pct = (now: number, prev: number): number | null =>
+  prev > 0 ? Math.round(((now - prev) / prev) * 1000) / 10 : null;
+const roundTo = (n: number, d = 2) => Math.round(n * 10 ** d) / 10 ** d;
+
+function shapeDay(r: DayRow) {
+  const quoted = r.quoted_not_paid;
+  return {
+    day: r.day,
+    calls: r.calls,
+    paid: r.paid,
+    free: r.free,
+    quoted_not_paid: quoted,
+    failed_settle: r.failed_settle,
+    usdPaid: roundTo(r.usdPaid, 6),
+    usdCogs: roundTo(r.usdCogs, 6),
+    usdDirect: roundTo(r.usdDirect, 6),
+    distinctPayers: r.payers.length,
+    // Computed HERE, not in the browser, so the site and the in-app HUD can
+    // never disagree about margin or the saving multiple.
+    marginPct: r.usdPaid > 0 ? roundTo(((r.usdPaid - r.usdCogs) / r.usdPaid) * 100, 1) : null,
+    lecoreSavingX: r.usdPaid > 0 ? roundTo(r.usdDirect / r.usdPaid, 2) : null,
+    conversionPct: r.paid + quoted > 0 ? roundTo((r.paid / (r.paid + quoted)) * 100, 1) : null,
+  };
+}
+
+export function statsPayload(topModels: { model: string; calls: number }[]) {
+  const days = Object.keys(daily).sort().map((d) => shapeDay(daily[d]));
+  const today = days[days.length - 1] ?? shapeDay(blankDay(new Date().toISOString().slice(0, 10)));
+  const prev = days.length >= 2 ? days[days.length - 2] : null;
+
+  // null, never 0, when there is not enough history — a zero would render as a
+  // flat line and read as "no growth" rather than "no data".
+  const dayOverDay = prev ? {
+    calls: pct(today.calls, prev.calls),
+    paid: pct(today.paid, prev.paid),
+    usdPaid: pct(today.usdPaid, prev.usdPaid),
+    distinctPayers: pct(today.distinctPayers, prev.distinctPayers),
+  } : null;
+
+  const sum = (rows: typeof days, k: "calls" | "paid" | "usdPaid") =>
+    rows.reduce((a, r) => a + (r[k] as number), 0);
+  const last7 = days.slice(-7);
+  const prev7 = days.slice(-14, -7);
+  const trailing7 = last7.length ? {
+    calls: sum(last7, "calls"),
+    paid: sum(last7, "paid"),
+    usdPaid: roundTo(sum(last7, "usdPaid"), 6),
+    avgDailyUsd: roundTo(sum(last7, "usdPaid") / last7.length, 6),
+  } : null;
+  const weekOverWeek = prev7.length === 7 && last7.length === 7 ? {
+    calls: pct(sum(last7, "calls"), sum(prev7, "calls")),
+    paid: pct(sum(last7, "paid"), sum(prev7, "paid")),
+    usdPaid: pct(sum(last7, "usdPaid"), sum(prev7, "usdPaid")),
+  } : null;
+
+  return {
+    app: "x402-tokens",
+    today,
+    days,
+    growth: { dayOverDay, weekOverWeek, trailing7 },
+    topModels,
+    coverage: {
+      days: days.length,
+      since: days[0]?.day ?? null,
+      complete: true,
+      caveat: "daily rows are folded from live events and persisted to the machine volume; "
+        + "history starts the day this rollup shipped and is never backfilled",
+      identifying: "none — payer counts are distinct 8-char prefixes, never full addresses or IPs",
+    },
+  };
+}
