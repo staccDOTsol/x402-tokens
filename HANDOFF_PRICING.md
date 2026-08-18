@@ -1,5 +1,14 @@
 # Handoff: gateway pricing model v2 (2026-08-15)
 
+> **SUPERSEDED 2026-08-18 — read this as history, not as the current model.**
+> The `markup * baseUsd` ceiling described below is gone. Price is now a
+> FRACTION of OpenRouter's own direct rate (ceiling 1x, never above), falling
+> with the tenant's trailing spend. `X402_MARKUP` survives only on the
+> per-unit media lane. The current model lives in `src/quote.ts` (quoteRequest),
+> `src/math.ts` (volumeRate) and `src/spend.ts`; the invariants are asserted in
+> `src/pricing.test.ts`. Everything below about the output clamp, the attach
+> cost basis and the adjacent defects still stands.
+
 For whoever picks this up (fresh session, other agent, human): everything below was
 measured today on the ttfx goldrun; nothing is hypothetical. **Do not deploy while a
 benchmark run is mid-flight** (standing rule), and note neither GitHub account can

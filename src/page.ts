@@ -71,10 +71,12 @@ they are NOT the same across rails:
   up for its transfer tax. Do not reprice it and DO NOT multiply it by
   10^decimals — that is already done. extra.decimals is for display only.
 - extra.feePayer: Solana rows only.
-- extra.pricing: "counterfactual" = a DISCOUNT off what this exact body would cost you
-  buying direct (extra.directUsd, extra.savesVsDirect). "markup" = small bodies, priced
-  ${cfg.markup}× cost. Long context is cheaper HERE than direct because leCore memory
-  means we never forward the whole body.
+- extra.pricing: how the price was formed. "volume" = a fraction of what this body costs
+  buying direct, set by your trailing ${cfg.volumeWindowDays}-day spend (extra.volume).
+  "counterfactual" = that, times a further leCore compression discount, because we never
+  forwarded the whole body. Either way extra.rate is the fraction of direct you paid and
+  it is NEVER above 1: this gateway is at most as expensive as OpenRouter, and cheaper the
+  more you use it. "markup" only appears on the per-unit media lane.
 - facilitator: ${cfg.facilitator}
 
 ${hasSvm ? `IF THE ROW YOU PICKED IS A SOLANA ROW — build one legacy Transaction:
@@ -315,7 +317,7 @@ GET  /v1/videos/{id}          # free to poll — the render was paid for at subm
   <div class=grid>
     <div class=card>
       <h3>Price</h3>
-      <p>Two bases, and the 402 says which. <b>Long context</b> (leCore engaged): a DISCOUNT off what that exact body would have cost you buying direct — <code>extra.directUsd</code> and <code>extra.savesVsDirect</code> are on the 402, so you can check it. <b>Short bodies</b> (nothing to spill): the published USD rate times ${esc(cfg.markup)}. USDC and USDG rails are $1 stable. <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> is Birdeye spot <em>at the 402</em>. Rails that settle through a yield wrap take 20bps on transfer — that's the yield, and <code>maxAmountRequired</code> already grosses it up.</p>
+      <p><b>Never more than OpenRouter.</b> Every price here is a fraction of what that exact body costs buying direct — <code>extra.directUsd</code>, <code>extra.rate</code> and <code>extra.savedPct</code> ride on the 402, so you can check it. The fraction <b>falls as you talk more</b>: your trailing ${esc(cfg.volumeWindowDays)}-day spend sets it, down to ${esc(Math.round(cfg.volume.rateFloor * 100))}% of direct, continuously and with no tier cliff (<code>extra.volume</code> shows where you are). <b>Long context</b> goes further still — when leCore compresses the body you pay a fraction of a fraction, because we never forwarded the whole thing. USDC and USDG rails are $1 stable. <a href="https://pump.fun/coin/EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump">TOKEN</a> is Birdeye spot <em>at the 402</em>. Rails that settle through a yield wrap take 20bps on transfer — that's the yield, and <code>maxAmountRequired</code> already grosses it up.</p>
     </div>
     <div class=card>
       <h3>Rails today</h3>
