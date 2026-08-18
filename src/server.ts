@@ -287,7 +287,7 @@ export function createServerFor(cfg: Config) {
     res.setHeader("vary", "origin");
     res.setHeader("access-control-allow-headers",
       "content-type, authorization, x-payment, x-hrr-context, x-hrr-top-k, x-hrr-gate, "
-      + "x-openzoo-namespace, x-openzoo-namespace-sig, x-openzoo-namespace-signer, "
+      + "x-openzoo-session, x-openzoo-namespace, x-openzoo-namespace-sig, x-openzoo-namespace-signer, "
       + "x-openzoo-namespace-ts, x-openzoo-namespace-chain");
     res.setHeader("access-control-expose-headers", "x-payment-response, x-402-priced-at");
     res.setHeader("access-control-max-age", "86400");
