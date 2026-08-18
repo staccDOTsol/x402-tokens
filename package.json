@@ -1,7 +1,7 @@
 {
   "name": "x402-tokens",
   "version": "0.1.0",
-  "description": "OpenRouter behind x402. Inference costs 3× USD, paid in wrapped TOKEN or yUSDCx, priced at the 402.",
+  "description": "OpenRouter behind x402. Never more than OpenRouter's own USD rate, cheaper with usage, paid in wrapped TOKEN or yUSDCx, priced at the 402.",
   "type": "module",
   "main": "./dist/server.js",
   "bin": {

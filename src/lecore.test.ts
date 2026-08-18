@@ -46,7 +46,7 @@ ok(estimateTokens(on.body.messages) === on.info.tokensAfter, "ON: reported token
 const msgs = on.body.messages as Array<{ role?: string; content?: string }>;
 ok(msgs[msgs.length - 1].content === "who is jarett?", "ON: the live ask survives verbatim");
 ok(String(msgs[0].content).includes("jarett is stacc"), "ON: recalled slice is injected");
-console.log(`\nBILLING: 402 priced on ${on.info.tokensAfter} tok instead of ${on.info.tokensBefore} -> ${(on.info.tokensBefore / on.info.tokensAfter).toFixed(1)}x cheaper at the same 3x markup`);
+console.log(`\nBILLING: 402 priced on ${on.info.tokensAfter} tok instead of ${on.info.tokensBefore} -> ${(on.info.tokensBefore / on.info.tokensAfter).toFixed(1)}x cheaper, and that ratio is the discount off buying direct`);
 
 // 4. sidecar down -> fail-open, never takes the zoo down
 const dead = await prepare({ ...base, lecoreUrl: "http://127.0.0.1:1" } as Config, body as Record<string, unknown>);

@@ -22,7 +22,7 @@ try {
       resource: `${cfg.publicUrl}/v1/chat/completions`,
       type: "http",
       x402Version: 1,
-      description: "OpenRouter chat completions. 3× USD via x402, paid in yUSDCx.",
+      description: "OpenRouter chat completions via x402, paid in yUSDCx. At most OpenRouter's own USD rate, less as you use it more.",
       accepts: [{
         scheme: "exact",
         network: cfg.network,

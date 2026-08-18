@@ -38,6 +38,77 @@ export function usdToRaw(usd: number, tokenUsd: number, decimals: number): bigin
 }
 
 /**
+ * VOLUME CURVE — the fraction of OpenRouter's OWN direct price a tenant pays,
+ * as a function of what that tenant has already spent here in the trailing
+ * window.
+ *
+ *     rate(S) = clamp( rateMax / (1 + S/scaleUsd)^decay , rateFloor, rateMax )
+ *
+ * The pricing contract is two sentences, and both of them are properties of
+ * this shape rather than of a table of hand-written tiers:
+ *
+ *   1. NEVER MORE THAN OPENROUTER. rate(0) = rateMax = 1, and the curve is
+ *      bounded above by rateMax, so the most expensive call anyone can ever
+ *      buy here is exactly what buying it direct would have cost. The old
+ *      flat 3x is gone: there is no expression in this file that can produce
+ *      a number above 1.
+ *
+ *   2. TALK MORE, PAY LESS. dr/dS <= 0 everywhere and the curve is
+ *      CONTINUOUS — no tier cliff, so there is no spend level at which one
+ *      more dollar moves the unit price discontinuously. (Same no-cliff law
+ *      quote.ts already enforces across body size; a pricing surface with a
+ *      step in it is a pricing surface someone games.)
+ *
+ * A power law rather than an exponential because spend is scale-free: the
+ * interesting range spans $0.001 to $10,000 and an exponential either does
+ * nothing at the bottom or saturates instantly at the top. With the shipped
+ * defaults (scale $10, decay 0.25, floor 0.25):
+ *
+ *      trailing 30d spend      rate      vs direct
+ *      $0                      1.000     par
+ *      $1                      0.977     2% off
+ *      $10                     0.841     16% off
+ *      $100                    0.549     45% off
+ *      $1,000                  0.315     68% off
+ *      $2,550+                 0.250     75% off (floor)
+ *
+ * `rateFloor` is a policy floor, not a safety floor: quote.ts additionally
+ * refuses to price under our own forwarded cost, and that cost floor always
+ * wins. See quoteRequest.
+ */
+export interface VolumeCurve {
+  /** ceiling, 1 = OpenRouter's own price. Nothing may exceed this. */
+  rateMax: number;
+  /** policy floor on the fraction of direct a tenant can reach. */
+  rateFloor: number;
+  /** spend, in USD, at which the curve has moved one unit of `decay`. */
+  scaleUsd: number;
+  /** exponent. 0 disables the curve (everyone pays rateMax). */
+  decay: number;
+}
+
+/**
+ * The curve is optional at the call site on purpose. A missing or half-filled
+ * curve must degrade to "everyone pays the ceiling", never throw: this runs
+ * inside quoteRequest, and an exception here does not mis-price a call, it
+ * turns the 402 into a 500 and takes the gateway down for everyone.
+ */
+export function volumeRate(spendUsd: number, c?: Partial<VolumeCurve>): number {
+  if (!c) return 1;
+  const max = Number.isFinite(c.rateMax) && (c.rateMax as number) > 0 ? Math.min(c.rateMax as number, 1) : 1;
+  const floor = Number.isFinite(c.rateFloor) ? Math.min(Math.max(c.rateFloor as number, 0), max) : max;
+  const scale = Number.isFinite(c.scaleUsd) && (c.scaleUsd as number) > 0 ? (c.scaleUsd as number) : 0;
+  const decay = Number.isFinite(c.decay) && (c.decay as number) > 0 ? (c.decay as number) : 0;
+  // A non-finite or negative spend is a bug upstream, never a discount: fall
+  // back to the ceiling rather than pricing off garbage.
+  const s = Number.isFinite(spendUsd) && spendUsd > 0 ? spendUsd : 0;
+  if (!scale || !decay) return max;
+  const r = max / Math.pow(1 + s / scale, decay);
+  if (!Number.isFinite(r)) return floor;
+  return Math.min(max, Math.max(floor, r));
+}
+
+/**
  * Token-2022 transfer-fee gross-up. `feeBps` is out of 10_000.
  * Sign `gross` so the destination receives `net` after withhold.
  */

@@ -1,5 +1,5 @@
 import type { Asset, Config } from "./config.js";
-import { estimateTokens, grossUp, openrouterUsd, usdToRaw } from "./math.js";
+import { estimateTokens, grossUp, openrouterUsd, usdToRaw, volumeRate } from "./math.js";
 import { getModel } from "./openrouter.js";
 
 export interface QuoteLine {
@@ -33,11 +33,49 @@ export interface Quote {
   billedUsd: number;
   pricedAt: string;
   accepts: QuoteLine[];
-  /** "counterfactual" = discounted against what buying direct would cost. */
-  pricing: "markup" | "counterfactual";
+  /**
+   * How this price was formed.
+   *   "volume"         — a fraction of OpenRouter's own direct rate, set by
+   *                      the tenant's trailing spend. The default text lane.
+   *   "counterfactual" — same, times the extra leCore compression discount,
+   *                      because we forwarded far fewer tokens than the caller
+   *                      would have bought direct.
+   *   "markup"         — units/media only (Together per-image / per-clip), and
+   *                      credit top-ups at markup 1. There is no OpenRouter
+   *                      price for a diffusion job to be cheaper than.
+   */
+  pricing: "markup" | "counterfactual" | "volume";
   directUsd?: number;
   discount?: number;
+  /**
+   * How many TIMES cheaper than buying direct this call was: directUsd /
+   * billedUsd. Under the pricing contract it is now always >= 1 — the ceiling
+   * makes billedUsd <= directUsd by construction — so it can be read as a
+   * "Nx cheaper" multiple without a sign check.
+   *
+   * It used to be able to come out BELOW 1 (0.3333 on every straight-3x
+   * markup call), which meant a UI printing "saves 0.33x" was reporting a 3x
+   * OVERCHARGE as a saving. That ambiguity is why the two unambiguous fields
+   * below exist; prefer them in new clients.
+   */
   savesVsDirect?: number;
+  /** Fraction of direct actually paid, in [0,1]. billedUsd / directUsd. */
+  rate?: number;
+  /** Fraction of direct NOT paid, in [0,1]. 1 - rate. "45% off". */
+  savedPct?: number;
+  /** Absolute USD kept vs buying direct. directUsd - billedUsd, never < 0. */
+  savedUsd?: number;
+  /** Why the rate is what it is, so a caller can see the curve rather than
+   *  infer it. */
+  volume?: {
+    /** trailing-window spend this tenant had BEFORE this call */
+    spendUsd: number;
+    /** the usage rate alone, before the leCore discount and the cost floor */
+    rate: number;
+    /** the best rate this curve can ever reach */
+    rateFloor: number;
+    windowDays: number;
+  };
   flooredAtCost?: boolean;
   /** Media only. Names HOW the upstream cost was derived ("per-image",
    *  "per-megapixel", "per-clip-block") because for image/video it is an
@@ -83,6 +121,9 @@ export async function quoteRequest(
   cfg: Config,
   body: { model?: string; messages?: unknown; max_tokens?: number; plugins?: unknown },
   counterfactualTokens?: number,
+  /** This tenant's spend in the trailing volume window, BEFORE this call.
+   *  0 / omitted = a brand-new tenant, who pays the ceiling. */
+  tenantSpendUsd = 0,
 ): Promise<Quote> {
   const modelId = body.model || cfg.defaultModel;
   const model = await getModel(cfg.openrouterUrl, cfg.openrouterKey, baseModelId(modelId));
@@ -98,6 +139,45 @@ export async function quoteRequest(
   // web surcharge rides on the UPSTREAM cost, so it flows through markup, the
   // counterfactual floor and every rail conversion exactly like token cost
   const baseUsd = openrouterUsd(model.prompt, model.completion, promptTokens, maxOut) + webUsd;
+
+  // THE PRICING CONTRACT (2026-08-18): OPENROUTER IS THE CEILING, AND THE
+  // PRICE FALLS AS A TENANT TALKS MORE.
+  //
+  // What this replaced: a flat `billedUsd = baseUsd * 3`. On every call where
+  // leCore did not compress anything — which is MOST calls, since short bodies
+  // never reach the spill threshold — that meant the caller paid 3x what the
+  // identical request costs at openrouter.ai. There is no story in which that
+  // survives someone opening a calculator, and it made the gateway strictly
+  // worse than the thing it sits in front of for the entire small-body regime.
+  //
+  // The replacement has exactly two rules:
+  //
+  //   CEILING.  billedUsd <= directUsd, always. `directUsd` is what buying
+  //             this same body from OpenRouter costs; when leCore did not
+  //             engage that is literally our own cost, so the ceiling is also
+  //             the honest at-cost price. Nothing below can breach it: the
+  //             final Math.min is unconditional.
+  //
+  //   DECREASE. The fraction of direct a tenant pays is volumeRate(spend),
+  //             which is 1.0 for their first call and decays monotonically
+  //             toward cfg.volume.rateFloor as their trailing-window spend
+  //             grows. Continuous, so no tier cliff.
+  //
+  // DECREASING IN WHAT, AND WHY THAT AXIS: trailing 30-day BILLED SPEND per
+  // tenant, not call count and not token count. Call count is free to
+  // manufacture (a thousand one-token pings would buy the floor rate for a
+  // dollar); tokens are free to manufacture in the other direction (pad the
+  // body). Spend is the one axis where gaming it costs exactly what it buys.
+  //
+  // WHERE THE DISCOUNT COMES FROM, honestly: it is funded by leCore. A bind is
+  // the expensive event and later asks against the same bound context are
+  // near-free (MEASURED: a $0.021372 direct call cost $0.000367 to serve), so
+  // the tenants who talk most are precisely the tenants whose calls are
+  // cheapest for us to serve. The curve pays that back. On a call where leCore
+  // did nothing our cost IS the direct price, the cost floor binds, and the
+  // caller pays the 1x ceiling — we cannot discount margin that does not
+  // exist, and we do not pretend otherwise.
+  const usageRate = volumeRate(tenantSpendUsd, cfg.volume);
 
   // COUNTERFACTUAL PRICING. A markup on the tokens we forward is
   // anti-correlated with a product whose whole job is to forward fewer tokens:
@@ -120,6 +200,17 @@ export async function quoteRequest(
     : null;
   const counterfactual = direct !== null && cfg.discount > 0;
   const floorUsd = baseUsd * cfg.floorMultiple;
+  // The price everything is now quoted against. When leCore compressed, that
+  // is the pre-compression body's direct cost; when it did not, `direct` is
+  // null and the body we forwarded IS the body they would have bought, so
+  // baseUsd is the like-for-like direct price. Never undefined — see the
+  // like-for-like note on directUsd below.
+  const directUsd = direct ?? baseUsd;
+  // Compression discount composes with the volume rate rather than replacing
+  // it, so a heavy user gets their volume rate ON TOP of the leCore discount
+  // instead of having to choose. The cost floor two lines down is what stops
+  // the composition from walking under our own spend.
+  const effectiveRate = usageRate * (counterfactual ? cfg.discount : 1);
   // NO CLIFF. The two modes used to be exclusive, which made price
   // NON-MONOTONIC in body size: MEASURED on the live gateway, 40,000 chars
   // billed $0.096426 (markup) while 42,000 chars billed $0.047421
@@ -129,14 +220,17 @@ export async function quoteRequest(
   // buy a discount. It also punishes exactly the careful user who trims their
   // prompt.
   //
-  // So the markup is a CEILING, never a cliff: whenever a counterfactual price
-  // exists, the caller pays the lower of the two. Below the spill threshold
-  // nothing changes (there is no counterfactual to compare against), and above
-  // it nobody can game a discount by inflating a body.
-  const markupUsd = baseUsd * cfg.markup;
-  const billedUsd = counterfactual
-    ? Math.min(Math.max(direct * cfg.discount, floorUsd), markupUsd)
-    : markupUsd;
+  // So there is ONE expression, and it is monotone: everything is a rate off
+  // the like-for-like direct price. Below the spill threshold directUsd is
+  // baseUsd and the rate is the volume rate; above it directUsd is the
+  // pre-compression cost and the rate additionally picks up cfg.discount.
+  // Nothing steps, so padding a body past the spill threshold can no longer
+  // buy a cheaper price than trimming it.
+  //
+  // Read outward-in: a rate off direct, lifted to our own cost floor, then
+  // capped — unconditionally — at direct itself. The cap is last on purpose.
+  // It is the whole contract, and no floor, discount or curve may outrank it.
+  const billedUsd = Math.min(Math.max(directUsd * effectiveRate, floorUsd), directUsd);
   const pricedAt = new Date().toISOString();
 
   const accepts: QuoteLine[] = [];
@@ -164,11 +258,14 @@ export async function quoteRequest(
     promptTokensEst: promptTokens,
     maxOut,
     openrouterUsd: baseUsd,
-    markup: cfg.markup,
+    // THE EFFECTIVE multiple over our own forwarded cost, not cfg.markup —
+    // which no longer participates in this lane at all. Reporting the config
+    // number here would claim a 3x that nothing charged.
+    markup: baseUsd > 0 ? billedUsd / baseUsd : 1,
     billedUsd,
     pricedAt,
     accepts,
-    pricing: counterfactual ? "counterfactual" : "markup",
+    pricing: counterfactual ? "counterfactual" : "volume",
     // LIKE-FOR-LIKE DENOMINATOR (same bug class the margin fix caught): when
     // leCore's compression never engaged, "what this would cost buying direct"
     // is trivially what it DID cost (baseUsd) -- not undefined/0. Leaving it
@@ -176,10 +273,23 @@ export async function quoteRequest(
     // the handful of compressed calls while cogsToday/paidWithCogsToday sum
     // every paid call, so "leCore saving" divides mismatched populations and
     // renders as a fake LOSS (direct << paid) instead of "no saving on this call".
-    directUsd: direct ?? baseUsd,
+    directUsd,
     discount: counterfactual ? cfg.discount : undefined,
-    savesVsDirect: (direct ?? baseUsd) / billedUsd,
-    flooredAtCost: counterfactual ? direct * cfg.discount < floorUsd : undefined,
+    savesVsDirect: billedUsd > 0 ? directUsd / billedUsd : 1,
+    // The two unambiguous readings of the same number. savesVsDirect is a
+    // MULTIPLE (2 = half price); rate/savedPct are FRACTIONS (0.5 / 0.5).
+    // Clamped into [0,1] rather than trusted, so a UI can render savedPct as
+    // a progress bar without defending against a negative.
+    rate: directUsd > 0 ? Math.min(1, billedUsd / directUsd) : 1,
+    savedPct: directUsd > 0 ? Math.max(0, 1 - billedUsd / directUsd) : 0,
+    savedUsd: Math.max(0, directUsd - billedUsd),
+    volume: {
+      spendUsd: tenantSpendUsd,
+      rate: usageRate,
+      rateFloor: cfg.volume.rateFloor,
+      windowDays: cfg.volumeWindowDays,
+    },
+    flooredAtCost: directUsd * effectiveRate < floorUsd,
   };
 }
 
@@ -281,9 +391,28 @@ export async function spotUsdCached(cfg: Config, a: Asset): Promise<{ usd: numbe
  * direct, and there is no such saving on a diffusion job. Applying it here
  * would be charging half price for work we pay full price for.
  */
-export function quoteUnits(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string): Quote {
+export function quoteUnits(
+  cfg: Config,
+  modelId: string,
+  upstreamUsd: number,
+  priceModel: string,
+  /**
+   * FACE-VALUE HOOK. Defaults to cfg.markup so media is unchanged, and
+   * /v1/credits/topup passes 1.
+   *
+   * Top-ups used to be written `quoteUnits(cfg, "credit", usd / cfg.markup)`
+   * and relied on the divide cancelling the multiply. That is correct
+   * arithmetic and a fragile contract: it silently sells credit at the wrong
+   * price the moment cfg.markup is 0, non-finite, or (as of this change)
+   * means something different than it did. Passing markup 1 and the raw USD
+   * makes "credit is sold at FACE VALUE" a property of the call site instead
+   * of a cancellation nobody can see from the receipt.
+   */
+  markup: number = cfg.markup,
+): Quote {
   if (!(upstreamUsd >= 0) || !Number.isFinite(upstreamUsd)) throw new Error("bad media cost");
-  const billedUsd = upstreamUsd * cfg.markup;
+  if (!(markup > 0) || !Number.isFinite(markup)) throw new Error("bad markup");
+  const billedUsd = upstreamUsd * markup;
   const pricedAt = new Date().toISOString();
   const accepts: QuoteLine[] = [];
   for (const a of cfg.assets) {
@@ -309,7 +438,7 @@ export function quoteUnits(cfg: Config, modelId: string, upstreamUsd: number, pr
     promptTokensEst: 0,
     maxOut: 0,
     openrouterUsd: upstreamUsd,
-    markup: cfg.markup,
+    markup,
     billedUsd,
     pricedAt,
     accepts,
@@ -353,11 +482,16 @@ async function applyLiveSpots(cfg: Config, q: Quote): Promise<Quote> {
   return q;
 }
 
-export async function quoteLive(cfg: Config, body: { model?: string; messages?: unknown; max_tokens?: number }, counterfactualTokens?: number): Promise<Quote> {
-  return applyLiveSpots(cfg, await quoteRequest(cfg, body, counterfactualTokens));
+export async function quoteLive(
+  cfg: Config,
+  body: { model?: string; messages?: unknown; max_tokens?: number },
+  counterfactualTokens?: number,
+  tenantSpendUsd = 0,
+): Promise<Quote> {
+  return applyLiveSpots(cfg, await quoteRequest(cfg, body, counterfactualTokens, tenantSpendUsd));
 }
 
 /** Media equivalent of quoteLive: flat upstream cost in, fully-priced 402 out. */
-export async function quoteMediaLive(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string): Promise<Quote> {
-  return applyLiveSpots(cfg, quoteUnits(cfg, modelId, upstreamUsd, priceModel));
+export async function quoteMediaLive(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string, markup?: number): Promise<Quote> {
+  return applyLiveSpots(cfg, quoteUnits(cfg, modelId, upstreamUsd, priceModel, markup));
 }

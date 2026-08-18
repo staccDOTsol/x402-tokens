@@ -34,11 +34,18 @@ export interface Requirements {
     /** price API was unreachable; this line rode the last-known spot
      *  (pricedAt names when that spot was fetched). */
     priceStale?: boolean;
-    /** how this price was formed. "counterfactual" = a DISCOUNT off what
-     *  buying this body direct would cost, not a markup on what we forward. */
-    pricing: "markup" | "counterfactual";
+    /** how this price was formed. "volume"/"counterfactual" = a FRACTION of
+     *  what buying this body direct would cost, never a markup on what we
+     *  forward. "markup" survives only on the per-unit media lane. */
+    pricing: "markup" | "counterfactual" | "volume";
     directUsd?: number;
+    /** directUsd/billedUsd, always >= 1 on the text lane. */
     savesVsDirect?: number;
+    /** billedUsd/directUsd — the fraction of direct actually charged. */
+    rate?: number;
+    savedPct?: number;
+    savedUsd?: number;
+    volume?: { spendUsd: number; rate: number; rateFloor: number; windowDays: number };
     markup?: number;
   };
 }
@@ -60,11 +67,16 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
     // reconcile. priceModel is set only on the media path, so it doubles as
     // the discriminator and tells the payer this is a per-unit estimate
     // against a vendor example rather than a metered token count.
-    description: q.pricing === "counterfactual"
-      ? `${q.model} — ${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper than buying direct, at ${a.pricedAt}`
-      : q.priceModel
-        ? `Together ${q.model} × ${q.markup}, ${q.priceModel} at ${a.pricedAt}`
-        : `OpenRouter ${q.model} × ${q.markup} at ${a.pricedAt}`,
+    //
+    // AND NAME THE RIGHT BASIS. This used to read "OpenRouter <model> × 3" on
+    // the ordinary text path, which was accurate and is no longer the deal:
+    // the text lane is a FRACTION of OpenRouter's own price, never a multiple
+    // of it. Quote the discount, not a multiplier that can no longer exceed 1.
+    description: q.priceModel
+      ? `Together ${q.model} × ${q.markup}, ${q.priceModel} at ${a.pricedAt}`
+      : (q.savedPct ?? 0) > 0.005
+        ? `${q.model} — ${Math.round((q.savedPct ?? 0) * 100)}% off buying direct (${(q.savesVsDirect ?? 1).toFixed(1)}× cheaper), at ${a.pricedAt}`
+        : `${q.model} — at OpenRouter's own price, never above it, at ${a.pricedAt}`,
     maxTimeoutSeconds: 120,
     extra: {
       facilitator: cfg.facilitator,
@@ -83,6 +95,10 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       pricing: q.pricing,
       directUsd: q.directUsd,
       savesVsDirect: q.savesVsDirect,
+      rate: q.rate,
+      savedPct: q.savedPct,
+      savedUsd: q.savedUsd,
+      volume: q.volume,
       // The EFFECTIVE multiplier, not the configured one. On the fail-open
       // path quoteLive runs with markup 1 (we charge at cost when our own
       // memory did not engage) — reporting cfg.markup there told the caller

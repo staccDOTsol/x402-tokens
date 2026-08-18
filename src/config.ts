@@ -1,4 +1,5 @@
 /** Env-driven config. Secrets never live in the repo. */
+import type { VolumeCurve } from "./math.js";
 
 export interface Asset {
   symbol: string;
@@ -53,9 +54,32 @@ export interface Config {
    *  Solana base58 address and cannot receive an ERC-20 transfer. */
   evmPayTo: string;
   feePayer: string;
+  /**
+   * UNITS/MEDIA MARKUP ONLY. This no longer touches the text price path.
+   *
+   * Text is priced off OpenRouter's own direct rate (ceiling 1x, decreasing
+   * with usage — see `volume` below and math.ts volumeRate), so there is
+   * nothing here for a markup to multiply. What remains on this field is the
+   * per-unit media lane (Together image/video), where there IS no OpenRouter
+   * price to be "no more expensive than" — the vendor bills per generation
+   * and the comparison the text ceiling is built on does not exist.
+   *
+   * Credit top-ups are explicitly NOT priced through it any more: /v1/credits
+   * passes markup 1 so face value is structural rather than an arithmetic
+   * cancellation that silently breaks if this number ever changes.
+   */
   markup: number;
+  /** Extra discount off direct when leCore actually compressed the body.
+   *  Composes multiplicatively with the volume rate. */
   discount: number;
+  /** Hard cost floor: never price under our own forwarded cost x this.
+   *  Always subordinate to the 1x-direct ceiling. */
   floorMultiple: number;
+  /** Usage-decreasing price curve. See math.ts volumeRate. */
+  volume: VolumeCurve;
+  /** Trailing window, in days, over which tenant spend is accumulated for
+   *  the volume curve. */
+  volumeWindowDays: number;
   openrouterKey: string;
   openrouterUrl: string;
   birdeyeKey: string;
@@ -267,11 +291,26 @@ export function loadConfig(): Config {
     payTo: opt("X402_PAY_TO", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
     evmPayTo: EVM_PAY_TO,
     feePayer: opt("X402_FEE_PAYER", "WzMaL78srutrF6CsxEkWuhMaDF5HZA6jNRaEPengqpb"),
+    // MEDIA/UNITS ONLY — the text lane no longer multiplies anything by this.
     markup: Number(opt("X402_MARKUP", "3")),
     // counterfactual pricing: fraction of what buying this body direct would cost
     discount: Number(opt("X402_DISCOUNT", "0.5")),
     // never price under our own forwarded cost x this
     floorMultiple: Number(opt("X402_FLOOR_MULTIPLE", "1.5")),
+    // THE PRICING CONTRACT, and every knob in it is env-tunable so it can be
+    // moved without a redeploy of the image:
+    //   X402_RATE_MAX=1     -> never more expensive than OpenRouter direct
+    //   X402_RATE_FLOOR     -> most a heavy tenant can ever get off (0.25 = 75% off)
+    //   X402_VOLUME_SCALE_USD / X402_VOLUME_DECAY -> how fast it gets there
+    // Setting X402_VOLUME_DECAY=0 pins everyone at the ceiling (1x direct)
+    // without changing any other behaviour — the kill switch for the curve.
+    volume: {
+      rateMax: Number(opt("X402_RATE_MAX", "1")),
+      rateFloor: Number(opt("X402_RATE_FLOOR", "0.25")),
+      scaleUsd: Number(opt("X402_VOLUME_SCALE_USD", "10")),
+      decay: Number(opt("X402_VOLUME_DECAY", "0.25")),
+    },
+    volumeWindowDays: Number(opt("X402_VOLUME_WINDOW_DAYS", "30")),
     openrouterKey: req("OPENROUTER_API_KEY"),
     openrouterUrl: opt("OPENROUTER_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     birdeyeKey: opt("BIRDEYE_API_KEY", ""),

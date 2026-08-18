@@ -41,6 +41,7 @@ const base = `http://127.0.0.1:${mport}`;
 const cfg = {
   port: 0, publicUrl: base, facilitator: base, network: "solana:test",
   payTo: "PAYTO", feePayer: "FEEPAYER", markup: 3, discount: 0.5, floorMultiple: 1.5,
+  volume: { rateMax: 1, rateFloor: 0.25, scaleUsd: 10, decay: 0.25 }, volumeWindowDays: 30,
   openrouterKey: "k", openrouterUrl: base, birdeyeKey: "", defaultModel: "m",
   lecoreUrl: "", lecoreKey: "", lecoreTenant: "zoo", lecoreSpillTokens: 8000,
   lecoreTopK: 8, lecoreTailChars: 2000, lecoreChunkChars: 1200, lecoreQueryChars: 400,

@@ -11,6 +11,9 @@
  *     price-API failure (429 must not 500 a quote), fail-closed past the bound.
  */
 import { grossUp } from "./math.js";
+import { appendFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
 
@@ -69,4 +72,67 @@ try { await spotUsdCached(cfg, asset); } catch { threw = true; }
 ok(threw, "past the staleness bound the quote fails closed, as before");
 
 globalThis.fetch = origFetch;
-console.log("feemath + spot-cache selftest OK");
+
+// --- 3. the volume curve, as pure maths -----------------------------------
+//
+// The price the gateway charges is directUsd x volumeRate(spend). Everything
+// the pricing contract promises therefore has to be true of this one function
+// before any quote is involved, including for inputs no sane caller produces.
+const { volumeRate } = await import("./math.js");
+const CURVE = { rateMax: 1, rateFloor: 0.25, scaleUsd: 10, decay: 0.25 };
+
+ok(volumeRate(0, CURVE) === 1, "spend $0 -> rate 1.0 (par with OpenRouter, never above)");
+ok(volumeRate(-5, CURVE) === 1, "a negative spend is a bug upstream, not a discount");
+ok(volumeRate(NaN, CURVE) === 1, "NaN spend falls back to the ceiling rather than pricing off garbage");
+ok(volumeRate(Infinity, CURVE) === 1, "an infinite spend is garbage too — ceiling, never a free lunch");
+ok(volumeRate(1_000, undefined) === 1, "a missing curve prices at the ceiling instead of throwing inside a 402");
+
+// The shipped curve, to 3dp. If someone retunes the defaults this table is
+// what tells them by how much.
+const table: Array<[number, number]> = [[1, 0.977], [10, 0.841], [100, 0.549], [1_000, 0.315], [2_550, 0.250]];
+for (const [spend, want] of table) {
+  const got = volumeRate(spend, CURVE);
+  ok(Math.abs(got - want) < 0.001, `$${spend} trailing spend -> ${got.toFixed(3)} of direct (expected ${want})`);
+}
+
+// Monotone and bounded on a fine sweep, not just at the table rows.
+let prev = Infinity, minSeen = 1, maxSeen = 0;
+for (let s = 0; s <= 20_000; s += 7.5) {
+  const r = volumeRate(s, CURVE);
+  if (r > prev + 1e-12) { console.error(`FAIL curve rose at $${s}`); process.exit(1); }
+  prev = r; minSeen = Math.min(minSeen, r); maxSeen = Math.max(maxSeen, r);
+}
+ok(true, "curve is non-increasing across a 2,667-point sweep to $20k");
+ok(maxSeen <= 1 && minSeen >= CURVE.rateFloor, `curve stays inside [${CURVE.rateFloor}, 1] (saw [${minSeen.toFixed(3)}, ${maxSeen.toFixed(3)}])`);
+ok(volumeRate(1_000, { ...CURVE, decay: 0 }) === 1, "decay 0 is the kill switch — everyone back at the ceiling");
+ok(volumeRate(1_000, { ...CURVE, rateFloor: 0.9 }) === 0.9, "a raised floor is respected");
+
+// --- 4. the trailing-spend ledger ----------------------------------------
+//
+// It is what feeds the curve, so its two load-bearing behaviours — durability
+// across a restart, and ageing out of the window — are priced behaviour.
+process.env.SPEND_PATH = join(mkdtempSync(join(tmpdir(), "spend-")), "spend.jsonl");
+const spend = await import("./spend.js");
+
+ok(spend.trailingSpend("t_new") === 0, "an unknown tenant has spent nothing -> pays the ceiling");
+spend.recordSpend("t_a", 0.25);
+spend.recordSpend("t_a", 0.75);
+spend.recordSpend("t_b", 10);
+ok(spend.trailingSpend("t_a") === 1, "spend accumulates per tenant");
+ok(spend.trailingSpend("t_b") === 10, "tenants are isolated from each other");
+spend.recordSpend("t_a", 0);
+spend.recordSpend("t_a", -5);
+spend.recordSpend("", 5);
+ok(spend.trailingSpend("t_a") === 1, "zero, negative and tenant-less writes are ignored");
+
+spend._resetSpend(); // "restart": drop the in-memory fold, replay from disk
+ok(spend.trailingSpend("t_a") === 1, "spend survives a restart — a redeploy must not reset anyone's price");
+
+// A day outside the window can never price anything again.
+const old = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+appendFileSync(process.env.SPEND_PATH, JSON.stringify({ tenant: "t_a", usd: 999, day: old }) + "\n");
+spend._resetSpend();
+ok(spend.trailingSpend("t_a", 30) === 1, "spend older than the window is excluded");
+ok(spend.trailingSpend("t_a", 365) === 1000, "...and included when the window is widened to cover it");
+
+console.log("feemath + spot-cache + volume-curve + spend-ledger selftest OK");

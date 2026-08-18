@@ -13,6 +13,7 @@ import { challenge, requirements, settle, verify } from "./x402.js";
 import { verifySignedNamespace } from "./nsauth.js";
 import { buildUnsignedPayment, type AcceptRow } from "./paybuild.js";
 import { applyCredit, creditBalance, grantCredit } from "./credits.js";
+import { recordSpend, trailingSpend } from "./spend.js";
 import { dedupObserve } from "./dedup.js";
 import * as usage from "./usage.js";
 
@@ -321,7 +322,18 @@ export function createServerFor(cfg: Config) {
         ok: true,
         rails: cfg.assets.map((a) => a.symbol),
         facilitator: cfg.facilitator,
+        // `markup` is the MEDIA lane only now. Text is a rate off OpenRouter's
+        // own price, and the whole contract is in `pricing` below.
         markup: cfg.markup,
+        pricing: {
+          ceiling: "openrouter-direct",
+          rateMax: cfg.volume.rateMax,
+          rateFloor: cfg.volume.rateFloor,
+          volumeScaleUsd: cfg.volume.scaleUsd,
+          volumeDecay: cfg.volume.decay,
+          volumeWindowDays: cfg.volumeWindowDays,
+          lecoreDiscount: cfg.discount,
+        },
       });
     }
 
@@ -460,7 +472,20 @@ export function createServerFor(cfg: Config) {
         id: m.id,
         object: "model",
         owned_by: "openrouter",
-        pricing: { prompt: m.prompt * cfg.markup, completion: m.completion * cfg.markup, unit: "USD", markup: cfg.markup },
+        // OPENROUTER'S OWN RATE, because that is now the CEILING — this list
+        // used to advertise it times 3, which was both the real price and an
+        // advertisement for buying elsewhere. `prompt`/`completion` are the
+        // most anyone pays; the rate falls from here with trailing spend
+        // (see math.ts volumeRate and the `volume` block on every receipt),
+        // and falls further whenever leCore compresses the body.
+        pricing: {
+          prompt: m.prompt,
+          completion: m.completion,
+          unit: "USD",
+          basis: "openrouter-direct",
+          note: "ceiling — never more than buying direct; decreases with trailing usage",
+          rateFloor: cfg.volume.rateFloor,
+        },
         // CLIENT-USABLE context, not the transformer window. Every model here
         // sits behind leCore auto-spill (+ POST /v1/hrr/bind), so a caller can
         // hand any of them a corpus far past its attention limit — that is the
@@ -628,6 +653,10 @@ export function createServerFor(cfg: Config) {
         evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: !paidByCredit });
         return json(res, out.status, out.json);
       }
+      // Media spend counts toward the text lane's volume curve. It is real
+      // money spent here, and splitting the two ledgers would mean a tenant
+      // who buys $500 of video still pays list price on their first sentence.
+      if (q.billedUsd > 0) recordSpend(tenantKey, q.billedUsd, cfg.volumeWindowDays);
       evt("served", { billedUsd: q.billedUsd, upstreamUsd, priceModel, tx: settled.transaction });
       return json(res, 200, out.json, {
         "x-402-billed-usd": String(q.billedUsd),
@@ -666,10 +695,17 @@ export function createServerFor(cfg: Config) {
           detail: "send x-openzoo-namespace with -sig / -signer / -ts (openzoo >= 0.44.0 does this automatically)",
         });
       }
-      // billedUsd = upstreamUsd * markup, so divide it back out: credit is sold
-      // at FACE VALUE. The markup is already taken on the calls it pays for,
-      // and charging it twice would make prepaying strictly worse than not.
-      const q = quoteUnits(cfg, "credit", usd / cfg.markup, "prepay");
+      // CREDIT IS SOLD AT FACE VALUE: $25 buys $25 of calls. Any take is
+      // already in the price of the calls it pays for, and charging it twice
+      // would make prepaying strictly worse than not — which would make this
+      // endpoint a trap rather than a latency win.
+      //
+      // Expressed as markup 1 on the raw USD instead of the old
+      // `usd / cfg.markup` divide-to-cancel. Same number today; but the old
+      // form only held while cfg.markup was a single global constant, and it
+      // is now a media-lane-only knob that pricing changes are free to move.
+      // Face value should not be a property of what X402_MARKUP happens to be.
+      const q = quoteUnits(cfg, "credit", usd, "prepay", 1);
       const resource = `${cfg.publicUrl}/v1/credits/topup`;
       const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
       const evt = (status: string, extra: Record<string, unknown> = {}) =>
@@ -877,11 +913,22 @@ export function createServerFor(cfg: Config) {
       // failed open at the 120s timeout. When leCore was supposed to engage and
       // didn't, price at direct (markup 1) — we still cover cost, and we never
       // punish a caller for our own outage.
+      //
+      // THIS IS NOW STRUCTURAL, not a special case: quoteRequest caps every
+      // text price at the like-for-like direct cost, and on a fail-open the
+      // body we forward IS the body they would have bought, so the cap already
+      // equals the old `markup: 1` override. The override is therefore gone
+      // (it multiplied a field the text lane no longer reads) and the flag is
+      // kept for TELEMETRY — a fail-open used to be invisible in the event log
+      // except as a surprising bill.
       const shouldHaveEngaged = Boolean(cfg.lecoreUrl)
         && !lecoreInfo.engaged
         && String(lecoreInfo.reason || "").startsWith("fail-open");
+      // Tenant resolved BEFORE the quote now: the price depends on it. Same
+      // key credits.ts and the sidecar partition by.
+      const tenantKey = tenantFor(cfg, req);
       const q = await quoteLive(
-        shouldHaveEngaged ? { ...cfg, markup: 1 } : cfg,
+        cfg,
         prepped,
         // ATTACH prices against the whole bound corpus, not tokensBefore. In
         // attach the ask is tiny and the recalled slice is ADDED, so
@@ -891,6 +938,10 @@ export function createServerFor(cfg: Config) {
         // of exactly 1/markup. SPILL is unchanged: there tokensBefore IS the
         // pre-compression body, which is the right counterfactual.
         lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : undefined,
+        // TALK MORE, PAY LESS. What this tenant has already spent here in the
+        // trailing window sets the fraction of OpenRouter's own price they
+        // pay. A new tenant is at the ceiling (1x direct, never above it).
+        trailingSpend(tenantKey, cfg.volumeWindowDays),
       );
       const reqs = requirements(cfg, q, resource);
       // one analytics line per chat request, whatever the outcome
@@ -906,6 +957,7 @@ export function createServerFor(cfg: Config) {
         // telemetry — it looks identical to "engaged and forwarded", and the
         // only symptom is a surprising bill.
         lecore_reason: lecoreInfo.engaged ? undefined : lecoreInfo.reason,
+        lecore_fail_open: shouldHaveEngaged || undefined,
         spill_tokens: lecoreInfo.spilledTokens,
         recalled: lecoreInfo.recalled,
         corpus_reuse: lecoreInfo.mode === "attach" || undefined,
@@ -916,7 +968,7 @@ export function createServerFor(cfg: Config) {
       // already taken (measured: $0.088 settled for an xAI auth-error body).
       // Those amounts become tenant credit; a quote fully covered by credit
       // serves WITHOUT payment. Optimistic consumption — see credits.ts.
-      const tenantKey = tenantFor(cfg, req);
+      // (tenantKey is resolved above the quote — the price depends on it.)
       let paidByCredit = false;
       if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
         applyCredit(tenantKey, q.billedUsd);
@@ -1024,6 +1076,13 @@ export function createServerFor(cfg: Config) {
       if (providerErrored && q.billedUsd > 0 && !paidByCredit) {
         grantCredit(tenantKey, q.billedUsd, "provider_error");
       }
+      // VOLUME LEDGER. Counts toward the tenant's next price — see spend.ts.
+      // Skipped on exactly the calls whose money is being handed straight back
+      // as credit: that credit gets spent on a later call which IS counted, and
+      // counting both would let a provider outage buy a discount twice.
+      if (q.billedUsd > 0 && !(providerErrored && !paidByCredit)) {
+        recordSpend(tenantKey, q.billedUsd, cfg.volumeWindowDays);
+      }
       evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
         payer: settled.payer ?? v.payer,
         upstream: out.status,
@@ -1042,7 +1101,18 @@ export function createServerFor(cfg: Config) {
           billedUsd: q.billedUsd,
           pricing: q.pricing,
           directUsd: q.directUsd,
+          // savesVsDirect is a MULTIPLE (2 = you paid half). It is now always
+          // >= 1 because billedUsd <= directUsd by construction — it used to
+          // read 0.3333 on every flat-3x call, which any UI rendering it as a
+          // saving turned into a 3x overcharge displayed as a win. The three
+          // fields below are the unambiguous fractions; prefer them.
           savesVsDirect: q.savesVsDirect,
+          rate: q.rate,
+          savedPct: q.savedPct,
+          savedUsd: q.savedUsd,
+          // WHY this rate: trailing spend, the curve's floor, the window.
+          // A caller can see what more usage buys instead of guessing.
+          volume: q.volume,
           // OUR upstream cost. Clients were deriving it as billedUsd/markup,
           // which is only right on a straight-markup call: under counterfactual
           // pricing billedUsd is min(direct×discount, markupUsd), so that
@@ -1051,6 +1121,7 @@ export function createServerFor(cfg: Config) {
           cogsUsd: q.openrouterUsd,
           markup: q.pricing === "markup" ? q.markup : undefined,
           paid: v.picked.asset,
+          lecore_fail_open: shouldHaveEngaged || undefined,
           amount: v.picked.maxAmountRequired,
           settle: settled,
           lecore: lecoreInfo,
