@@ -728,7 +728,17 @@ export function createServerFor(cfg: Config) {
       // form only held while cfg.markup was a single global constant, and it
       // is now a media-lane-only knob that pricing changes are free to move.
       // Face value should not be a property of what X402_MARKUP happens to be.
-      const q = quoteUnits(cfg, "credit", usd, "prepay", 1);
+      // LIVE PRICES, not face value. quoteUnits falls back to `stableUsd ?? 1`,
+      // so every non-stable asset was quoted at ONE DOLLAR: $5 of credit cost
+      // 5 TOKEN (~$0.0012) or 5 LEOS — a ~4,000x and ~7,000x discount, and
+      // credit is spendable at full value. The chat path never had this
+      // because it goes through applyLiveSpots; top-up called quoteUnits
+      // directly and skipped it.
+      //
+      // quoteMediaLive is exactly applyLiveSpots(quoteUnits(...)), which also
+      // DROPS any asset with no believable spot rather than inventing one —
+      // so a dead pool removes that row instead of underpricing it.
+      const q = await quoteMediaLive(cfg, "credit", usd, "prepay", 1);
       const resource = `${cfg.publicUrl}/v1/credits/topup`;
       const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
       const evt = (status: string, extra: Record<string, unknown> = {}) =>
