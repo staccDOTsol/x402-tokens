@@ -57,16 +57,54 @@ const here = fileURLToPath(new URL(".", import.meta.url));
  * behavior — same as today, just logged — until the flag flips to "1", at
  * which point an unsigned or invalid claim loses the custom namespace
  * (falls back to the shared base tenant) instead of getting one. Never a
- * hard 401: every route that calls tenantFor is a documented free
- * passthrough (see /v1/hrr/bind, /v1/lecore/* below), and refusing the
- * request outright would break that for callers mid-migration — losing
- * isolation gracefully is the correct failure mode here, not losing the
- * endpoint.
+ * hard 401 on a FREE route: /v1/hrr/bind, /v1/lecore/* and friends are
+ * documented passthroughs, and refusing them outright would break callers
+ * mid-migration — losing isolation gracefully is the correct failure mode
+ * there, not losing the endpoint.
+ *
+ * MONEY ROUTES ARE THE EXCEPTION (see namespaceFailure below). Degrading
+ * gracefully means "bill the shared tenant", which on a paid path is not
+ * graceful at all — it silently moves the charge to someone else's balance.
+ * When a caller SENT a signature and it did not verify, the three paid routes
+ * answer 401 instead. Callers who never sign are unaffected on every route.
  */
 function headerStr(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];
   const s = Array.isArray(v) ? v[0] : v;
   return typeof s === "string" && s.length ? s : undefined;
+}
+
+/**
+ * Why a caller's namespace proof failed, or null when there is nothing to
+ * report — either they never tried to prove one, or the proof was good.
+ *
+ * THE BUG THIS EXISTS TO CLOSE. `tenantFor` treats an INVALID or EXPIRED
+ * signature the same as no signature at all: it logs and returns the SHARED
+ * tenant. On a money path that is silent misbilling. A browser wallet's
+ * signature expires after `lecoreNamespaceSigWindowMs` (5 min by default), so
+ * a user who leaves a tab open crosses that line without touching anything —
+ * and their next call spends the SHARED balance while the UI still shows
+ * their own. They are told nothing, and the credit they prepaid is not the
+ * credit that drains.
+ *
+ * Someone who sent a signature has stated an intent: bill MY tenant. Falling
+ * back to a different payer is never the answer they wanted, so the money
+ * routes refuse instead. Callers that never attempt a signature are untouched
+ * — this deliberately does not force signing on anyone.
+ */
+function namespaceFailure(cfg: Config, req: IncomingMessage): string | null {
+  const ns = req.headers["x-openzoo-namespace"];
+  if (typeof ns !== "string" || !ns.trim()) return null;
+  const sig = headerStr(req, "x-openzoo-namespace-sig");
+  const signer = headerStr(req, "x-openzoo-namespace-signer");
+  const ts = headerStr(req, "x-openzoo-namespace-ts");
+  const chain = headerStr(req, "x-openzoo-namespace-chain");
+  if (!(sig || signer || ts)) return null;      // never attempted — not a failure
+  const v = verifySignedNamespace(
+    { namespace: ns.trim(), signature: sig, signer, timestamp: ts, chain },
+    cfg.lecoreNamespaceSigWindowMs,
+  );
+  return v.ok ? null : (v.reason ?? "invalid namespace signature");
 }
 
 function tenantFor(cfg: Config, req: IncomingMessage): string {
@@ -545,6 +583,19 @@ export function createServerFor(cfg: Config) {
         logEvent({ path: url.pathname, status, model: modelId, kind, bodyBytes, ip, ...extra });
 
       const header = req.headers["x-payment"] as string | undefined;
+      // A signature that was SENT but did not verify means "bill my tenant"
+      // could not be honoured. Refusing is the only safe answer: the silent
+      // fallback below bills the SHARED balance instead, which the caller has
+      // no way to notice. Expiry is the common case (5 min window), so say so.
+      const nsFail = namespaceFailure(cfg, req);
+      if (nsFail) {
+        logEvent({ path: url.pathname, status: "namespace_sig_rejected", reason: nsFail });
+        return json(res, 401, {
+          error: "namespace signature rejected",
+          detail: nsFail,
+          hint: "re-sign openzoo-namespace:<namespace>:<timestamp> with a fresh timestamp and retry",
+        });
+      }
       const tenantKey = tenantFor(cfg, req);
       let paidByCredit = false;
       if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
@@ -620,6 +671,19 @@ export function createServerFor(cfg: Config) {
       const usd = Number(body.usd);
       if (!Number.isFinite(usd) || usd < 1 || usd > 500) {
         return json(res, 400, { error: "usd must be a number between 1 and 500" });
+      }
+      // A signature that was SENT but did not verify means "bill my tenant"
+      // could not be honoured. Refusing is the only safe answer: the silent
+      // fallback below bills the SHARED balance instead, which the caller has
+      // no way to notice. Expiry is the common case (5 min window), so say so.
+      const nsFail = namespaceFailure(cfg, req);
+      if (nsFail) {
+        logEvent({ path: url.pathname, status: "namespace_sig_rejected", reason: nsFail });
+        return json(res, 401, {
+          error: "namespace signature rejected",
+          detail: nsFail,
+          hint: "re-sign openzoo-namespace:<namespace>:<timestamp> with a fresh timestamp and retry",
+        });
       }
       const tenantKey = tenantFor(cfg, req);
       // Credit is keyed by TENANT, and an unsigned request resolves to the
@@ -882,6 +946,19 @@ export function createServerFor(cfg: Config) {
       // already taken (measured: $0.088 settled for an xAI auth-error body).
       // Those amounts become tenant credit; a quote fully covered by credit
       // serves WITHOUT payment. Optimistic consumption — see credits.ts.
+      // A signature that was SENT but did not verify means "bill my tenant"
+      // could not be honoured. Refusing is the only safe answer: the silent
+      // fallback below bills the SHARED balance instead, which the caller has
+      // no way to notice. Expiry is the common case (5 min window), so say so.
+      const nsFail = namespaceFailure(cfg, req);
+      if (nsFail) {
+        logEvent({ path: url.pathname, status: "namespace_sig_rejected", reason: nsFail });
+        return json(res, 401, {
+          error: "namespace signature rejected",
+          detail: nsFail,
+          hint: "re-sign openzoo-namespace:<namespace>:<timestamp> with a fresh timestamp and retry",
+        });
+      }
       const tenantKey = tenantFor(cfg, req);
       let paidByCredit = false;
       if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
