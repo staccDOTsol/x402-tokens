@@ -11,6 +11,7 @@ import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, sub
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import { verifySignedNamespace } from "./nsauth.js";
+import { mintSession, tenantFromSession } from "./session.js";
 import { buildUnsignedPayment, PayBuildError, type AcceptRow } from "./paybuild.js";
 import { applyCredit, creditBalance, grantCredit } from "./credits.js";
 import { recordSpend, trailingSpend } from "./spend.js";
@@ -72,6 +73,13 @@ function headerStr(req: IncomingMessage, name: string): string | undefined {
 }
 
 function tenantFor(cfg: Config, req: IncomingMessage): string {
+  // A SESSION is a signature that was already verified, so it is checked
+  // first and needs no replay window: the token carries its own expiry. This
+  // is what lets a browser wallet bill its own tenant without re-signing
+  // every five minutes.
+  const sess = tenantFromSession(cfg, headerStr(req, "x-openzoo-session"));
+  if (sess) return sess;
+
   const ns = req.headers["x-openzoo-namespace"];
   if (typeof ns !== "string" || !ns.trim()) return cfg.lecoreTenant;
   const namespace = ns.trim();
@@ -681,6 +689,58 @@ export function createServerFor(cfg: Config) {
     // Credit is already spent automatically wherever a quote is priced, but
     // nothing could ever ADD credit except an error refund. Buying it in one
     // settlement lets every later call skip verify+settle entirely.
+    /**
+     * Exchange a namespace signature for a 24h session token.
+     *
+     * Deliberately mints from tenantFor()'s OWN result rather than
+     * re-deriving: whatever proves a tenant elsewhere proves it here, so the
+     * two can never drift apart. An unsigned caller resolves to the shared
+     * tenant, which must never be handed out as a session — that would mint
+     * a credential for everyone's balance.
+     */
+    if (req.method === "POST" && url.pathname === "/v1/auth/session") {
+      // Verify the signature HERE rather than leaning on tenantFor's silent
+      // fallback: that path downgrades an expired signature to the shared
+      // tenant, and minting a session from it would hand out a credential for
+      // everyone's balance.
+      const sig = headerStr(req, "x-openzoo-namespace-sig");
+      const signer = headerStr(req, "x-openzoo-namespace-signer");
+      const ts = headerStr(req, "x-openzoo-namespace-ts");
+      const chainH = headerStr(req, "x-openzoo-namespace-chain");
+      const nsRaw = req.headers["x-openzoo-namespace"];
+      const nsStr = typeof nsRaw === "string" ? nsRaw.trim() : "";
+      if (!nsStr || !(sig && signer && ts)) {
+        return json(res, 403, {
+          error: "a session requires a signed namespace",
+          detail: "send x-openzoo-namespace with -sig / -signer / -ts",
+        });
+      }
+      const v = verifySignedNamespace(
+        { namespace: nsStr, signature: sig, signer, timestamp: ts, chain: chainH },
+        cfg.lecoreNamespaceSigWindowMs,
+      );
+      if (!v.ok) {
+        return json(res, 401, { error: "namespace signature rejected", detail: v.reason });
+      }
+      const tenant = tenantFor(cfg, req);
+      if (tenant === cfg.lecoreTenant) {
+        return json(res, 403, {
+          error: "a session requires a signed namespace",
+          detail: "send x-openzoo-namespace with -sig / -signer / -ts",
+        });
+      }
+      try {
+        const { token, expiresAt } = mintSession(cfg, tenant);
+        logEvent({ path: url.pathname, status: "session_minted" });
+        return json(res, 200, {
+          token, expiresAt,
+          usage: "send it as x-openzoo-session on any request; it replaces the namespace headers",
+        });
+      } catch (e) {
+        return json(res, 503, { error: "sessions are not configured", detail: (e as Error).message });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/v1/credits") {
       return json(res, 200, { balanceUsd: creditBalance(tenantFor(cfg, req)) });
     }
