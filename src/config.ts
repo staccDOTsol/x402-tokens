@@ -276,6 +276,23 @@ export function loadConfig(): Config {
       priceMint: opt("MEME_UNDERLYING", process.env.MEME_MINT),
     });
   }
+  // LEOS, on the same terms as TOKEN. Off until LEOS_MINT is set, exactly like
+  // the rail above — the entry is meaningless without the wrapped twin, which
+  // is minted by scripts/create-leos.mjs.
+  //
+  // NINE decimals, not six. wLEOSx takes the UNDERLYING's decimals because the
+  // deployed wrap program reads mint_decimals() at runtime, so defaulting to 6
+  // here would mis-scale every transfer_checked on this rail. Priced off the
+  // UNDERLYING (LEOS) — the twin has no market of its own.
+  if (process.env.LEOS_MINT) {
+    assets.push({
+      symbol: opt("LEOS_SYMBOL", "wLEOSx"),
+      mint: process.env.LEOS_MINT,
+      decimals: Number(opt("LEOS_DECIMALS", "9")),
+      feeBps: Number(opt("LEOS_FEE_BPS", "20")),
+      priceMint: opt("LEOS_UNDERLYING", "5xgsnby6P9zqGK71J7H4yJLxzqPvNbC7rDZxNzjHmj7e"),
+    });
+  }
 
   return {
     port: Number(opt("PORT", "8787")),
