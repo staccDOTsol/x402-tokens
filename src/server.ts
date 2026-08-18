@@ -690,8 +690,22 @@ export function createServerFor(cfg: Config) {
       let body: { usd?: unknown };
       try { body = JSON.parse(raw || "{}"); } catch { return json(res, 400, { error: "invalid json" }); }
       const usd = Number(body.usd);
-      if (!Number.isFinite(usd) || usd < 1 || usd > 500) {
-        return json(res, 400, { error: "usd must be a number between 1 and 500" });
+      // NO $500 CEILING. It was an arbitrary guard that mostly stopped people
+      // giving us money — someone topping up $5,000 hit a 400 and left. The
+      // payment is settled on chain before any credit is granted, so an
+      // oversized number costs the caller, not us; there is nothing to protect
+      // against by refusing it. Kept configurable so a ceiling can come back
+      // without a code change if a real reason for one appears.
+      //
+      // The FLOOR stays: a top-up below a cent cannot be represented in the
+      // rails' 6-decimal units and would settle as a no-op.
+      const maxTopUp = Number(process.env.X402_CREDIT_MAX_USD || "0") || Infinity;
+      if (!Number.isFinite(usd) || usd < 0.01 || usd > maxTopUp) {
+        return json(res, 400, {
+          error: Number.isFinite(maxTopUp)
+            ? `usd must be a number between 0.01 and ${maxTopUp}`
+            : "usd must be a number of at least 0.01",
+        });
       }
       const tenantKey = tenantFor(cfg, req);
       // Credit is keyed by TENANT, and an unsigned request resolves to the
