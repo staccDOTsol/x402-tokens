@@ -11,7 +11,7 @@ import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, sub
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import { verifySignedNamespace } from "./nsauth.js";
-import { buildUnsignedPayment, type AcceptRow } from "./paybuild.js";
+import { buildUnsignedPayment, PayBuildError, type AcceptRow } from "./paybuild.js";
 import { applyCredit, creditBalance, grantCredit } from "./credits.js";
 import { recordSpend, trailingSpend } from "./spend.js";
 import { dedupObserve } from "./dedup.js";
@@ -415,15 +415,25 @@ export function createServerFor(cfg: Config) {
         });
       }
       try {
-        const built = await buildUnsignedPayment(cfg.solanaRpc, body.accept, body.payer);
-        logEvent({ path: url.pathname, status: "pay_built" });
+        const built = await buildUnsignedPayment(
+          cfg.solanaRpc, body.accept, body.payer, cfg.facilitator,
+        );
+        logEvent({ path: url.pathname, status: "pay_built", reason: built.wrap ? "wrapped" : "direct" });
         return json(res, 200, built);
       } catch (e) {
         // A bad pubkey or an unknown mint is the CALLER's error; an RPC that
         // will not answer is ours. Both are 400-shaped to the client, but say
         // which so a mobile dev is not left guessing.
-        const msg = (e as Error).message.slice(0, 200);
+        const msg = (e as Error).message.slice(0, 400);
         logEvent({ path: url.pathname, status: "pay_build_failed", reason: msg });
+        // A PayBuildError is a DIAGNOSIS, not a crash — the payer is short of
+        // the underlying, or the asset's acquire recipe did not check out.
+        // Answer it here with the code and the numbers: the alternative is a
+        // built transaction that dies at InstructionError[2, InvalidAccountData],
+        // which reads like a mint failure and has burned real debugging time.
+        if (e instanceof PayBuildError) {
+          return json(res, 400, { error: e.message, code: e.code, ...e.detail });
+        }
         return json(res, 400, { error: "could not build payment", detail: msg });
       }
     }
