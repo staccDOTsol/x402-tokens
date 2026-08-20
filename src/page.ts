@@ -12,9 +12,12 @@ const chainName = (n: string) =>
  * User-facing copy names the UNDERLYING asset, never the settlement wrap.
  * Wrap tickers follow y<X>x / w<X>x (yUSDCx, wTOKENx, wUSDGx, future w*x
  * twins) — strip the affixes so new wrapped rails read as their own asset
- * automatically when they join accepts[].
+ * automatically when they join accepts[]. wTOKENx2 is TOKEN: the trailing
+ * `2` is a mint generation, not part of the underlying ticker, and
+ * `/^[wy].{1,}x$/` + slice does not strip it.
  */
-const underlyingName = (s: string) => (/^[wy].{1,}x$/.test(s) ? s.slice(1, -1) : s);
+export const underlyingName = (s: string) =>
+  /^wTOKENx2?$/.test(s) ? "TOKEN" : /^[wy].{1,}x$/.test(s) ? s.slice(1, -1) : s;
 
 const uniq = <T,>(xs: T[]) => [...new Set(xs)];
 
