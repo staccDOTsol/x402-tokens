@@ -105,8 +105,8 @@ ok(!String(chal.help).includes("BEFORE it lands"), "challenge.help is not deposi
 const reqs = requirements(cfg, q, "http://localhost/v1/chat/completions");
 ok(reqs[0].extra.acquire?.method === "spl-token-wrap", "402 extra.acquire is spl-token-wrap");
 ok(reqs[0].extra.acquire?.steps.length === 1, "402 extra.acquire.steps is one Wrap");
-ok(reqs[0].extra.acquire?.steps[0].note.includes("NINE accounts"), "402 acquire.steps note is 9-account");
-ok(!reqs[0].extra.acquire?.steps.some((s) => s.instruction === "TransferChecked" as never), "402 acquire.steps has no TransferChecked");
+ok(reqs[0].extra.acquire?.steps[0].note.includes("NINE accounts") === true, "402 acquire.steps note is 9-account");
+ok(!(reqs[0].extra.acquire?.steps.some((s) => (s.instruction as string) === "TransferChecked")), "402 acquire.steps has no TransferChecked");
 
 const prompt = clankerPrompt(cfg);
 ok(prompt.includes("NINE accounts") || prompt.includes("9 accounts"), "clanker prompt lists 9 accounts");
