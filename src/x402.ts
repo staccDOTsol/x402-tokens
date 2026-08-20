@@ -1,5 +1,6 @@
 import type { Config } from "./config.js";
 import type { Quote } from "./quote.js";
+import { acquireForMint, solanaWrap402Help, type WrapAcquire } from "./wrapspec.js";
 
 export interface Requirements {
   scheme: "exact";
@@ -47,6 +48,11 @@ export interface Requirements {
     savedUsd?: number;
     volume?: { spendUsd: number; rate: number; rateFloor: number; windowDays: number };
     markup?: number;
+    /**
+     * Solana wrap-nav rails only. Post-exploit 9-account Wrap recipe — the
+     * program CPIs the deposit. A 5-account + TransferChecked shape dies 0x6a.
+     */
+    acquire?: WrapAcquire;
   };
 }
 
@@ -105,6 +111,7 @@ export function requirements(cfg: Config, q: Quote, resource: string): Requireme
       // they paid 3x when they paid 1x, on exactly the calls where trust
       // matters most. q.markup is what actually formed this price.
       markup: q.pricing === "markup" ? q.markup : undefined,
+      acquire: isEvm ? undefined : acquireForMint(a.mint, a.symbol),
     },
   };
   });
@@ -117,7 +124,7 @@ export function challenge(cfg: Config, q: Quote, resource: string, error = "paym
     error,
     // Name UNDERLYING assets, never the wrapper tickers — those are internal
     // plumbing. Derived from the live rails so it cannot drift out of date.
-    help: `Pay in ${underlyingNames(cfg)}. Don't hold any yet? ${cfg.facilitator}/start. Each accepts[] row carries extra.decimals — maxAmountRequired is already in that asset's raw units, do not rescale it.`,
+    help: solanaWrap402Help(underlyingNames(cfg), cfg.facilitator),
   };
 }
 

@@ -25,6 +25,10 @@ import {
   unpackMint,
 } from "@solana/spl-token";
 import { TransactionInstruction } from "@solana/web3.js";
+import {
+  WRAP_NAV_PROGRAM,
+  WRAP_STEP_NOTE,
+} from "./wrapspec.js";
 
 export type AcceptRow = {
   scheme: string;
@@ -68,7 +72,7 @@ async function mintInfo(conn: Connection, mintStr: string) {
   return out;
 }
 
-type WrapPool = {
+export type WrapPool = {
   programId: PublicKey; wrapped: PublicKey; wrappedProgram: PublicKey;
   underlying: PublicKey; underlyingProgram: PublicKey; underlyingDecimals: number;
   underlyingSymbol: string; escrow: PublicKey; authority: PublicKey; bump: number;
@@ -88,21 +92,18 @@ function depositForShares(sharesNeeded: bigint, reserves: bigint, supply: bigint
 }
 
 /**
- * The three instructions of a conversion, in the MAINNET-PROVEN order from
- * lib/wrap.js: ensure the wrapped ATA, mint shares, then move the deposit
- * into escrow.
+ * ATA-ensure + 9-account Wrap. Matches desktop openzoo lib/wrap.js after the
+ * 2026-08-18 rewrite of FrSERTNCP…: the program CPIs the deposit, so there is
+ * no separate TransferChecked. A 5-account Wrap dies 0x6a at need(accounts, 9)?.
  *
- * The order looks wrong and is not. The facilitator's own acquire directory
- * lists TransferChecked before Wrap, but its note gives the reason to ignore
- * that ordering: the program "prices the deposit off the escrow balance
- * BEFORE it lands". Wrap must therefore read PRE-deposit reserves, so it runs
- * first; deposit-then-wrap would price the shares against reserves that
- * already include the deposit and mint too few.
+ * Ignore any facilitator /supported acquire.steps that still list
+ * TransferChecked-then-Wrap — that directory is stale. Account 4 (wrapped
+ * token program) vs 8 (unwrapped token program) are not interchangeable.
  *
  * `rentPayer` is the 402's feePayer, not the user — which is why a user needs
  * the token but no SOL.
  */
-function buildWrapInstructions(
+export function buildWrapInstructions(
   pool: WrapPool, owner: PublicKey, rentPayer: PublicKey, depositRaw: bigint,
 ): TransactionInstruction[] {
   const userWrapped = getAssociatedTokenAddressSync(pool.wrapped, owner, false, pool.wrappedProgram);
@@ -123,13 +124,13 @@ function buildWrapInstructions(
         { pubkey: userWrapped, isSigner: false, isWritable: true },
         { pubkey: pool.authority, isSigner: false, isWritable: false },
         { pubkey: pool.wrappedProgram, isSigner: false, isWritable: false },
+        { pubkey: userUnderlying, isSigner: false, isWritable: true },
+        { pubkey: owner, isSigner: true, isWritable: false },
+        { pubkey: pool.underlying, isSigner: false, isWritable: false },
+        { pubkey: pool.underlyingProgram, isSigner: false, isWritable: false },
       ],
       data,
     }),
-    createTransferCheckedInstruction(
-      userUnderlying, pool.underlying, pool.escrow, owner,
-      depositRaw, pool.underlyingDecimals, [], pool.underlyingProgram,
-    ),
   ];
 }
 
@@ -181,6 +182,10 @@ async function planWrap(
   }) as { extra?: Record<string, any> } | undefined;
   const acq = row?.extra?.acquire;
   if (!acq || acq.method !== "spl-token-wrap") return null;
+  // Directory steps are hints for humans. Some /supported rows still list
+  // TransferChecked-then-Wrap (pre-exploit). Never honor that shape — the
+  // deployed program is 9-account and CPIs the deposit. This builder always
+  // emits ATA + 9-account Wrap regardless of acq.steps.
 
   const programId = new PublicKey(acq.program);
   const wrapped = new PublicKey(accept.asset);
@@ -227,9 +232,9 @@ async function planWrap(
   ]);
   const depositRaw = depositForShares(shortfall, reserves, supply);
 
-  // PRE-FLIGHT. With no underlying the deposit fails at instruction index 2 as
-  // InvalidAccountData, which reads like "MintTo failed" in a truncated log
-  // and has cost real debugging time before. Say the actual problem instead.
+  // PRE-FLIGHT. With no underlying the 9-account Wrap's CPI deposit fails
+  // (often as InvalidAccountData in a truncated log, which used to read like
+  // "MintTo failed"). Say the actual problem instead.
   const userUnderlying = getAssociatedTokenAddressSync(
     underlying, payer, false, underlyingProgram);
   const have = await conn.getTokenAccountBalance(userUnderlying)
@@ -303,7 +308,8 @@ export async function buildUnsignedPayment(
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({
     units: 300_000 + Math.floor(Math.random() * 200_000),
   }));
-  // Acquire before spending: ATA, wrap, deposit — then the payment.
+  // Acquire before spending: ATA + 9-account Wrap (program CPIs the deposit)
+  // — then the payment TransferChecked of the wrapped mint.
   if (plan) {
     for (const ix of buildWrapInstructions(plan.pool, payer, feePayer, plan.depositRaw)) tx.add(ix);
   }
@@ -334,7 +340,10 @@ export async function buildUnsignedPayment(
       ? {
         wrap: {
           method: "spl-token-wrap",
-          program: plan.pool.programId.toBase58(),
+          program: plan.pool.programId.toBase58() || WRAP_NAV_PROGRAM,
+          accounts: 9,
+          instruction: "Wrap",
+          note: WRAP_STEP_NOTE,
           underlying: plan.pool.underlying.toBase58(),
           underlyingSymbol: plan.pool.underlyingSymbol,
           underlyingDecimals: plan.pool.underlyingDecimals,
