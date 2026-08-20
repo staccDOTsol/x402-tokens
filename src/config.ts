@@ -72,8 +72,9 @@ export interface Config {
   /** Extra discount off direct when leCore actually compressed the body.
    *  Composes multiplicatively with the volume rate. */
   discount: number;
-  /** Hard cost floor: never price under our own forwarded cost x this.
-   *  Always subordinate to the 1x-direct ceiling. */
+  /** Hard cost floor: at-cost only (our own forwarded OpenRouter spend).
+   *  Always subordinate to the 1x-direct ceiling. Never a 1.5× lift —
+   *  quoteRequest clamps the effective multiple to ≤ 1. */
   floorMultiple: number;
   /** Usage-decreasing price curve. See math.ts volumeRate. */
   volume: VolumeCurve;
@@ -309,8 +310,10 @@ export function loadConfig(): Config {
     markup: Number(opt("X402_MARKUP", "3")),
     // counterfactual pricing: fraction of what buying this body direct would cost
     discount: Number(opt("X402_DISCOUNT", "0.5")),
-    // never price under our own forwarded cost x this
-    floorMultiple: Number(opt("X402_FLOOR_MULTIPLE", "1.5")),
+    // at-cost only: never a 1.5× lift above OpenRouter. quoteRequest also
+    // clamps the effective multiple to ≤ 1, so a leftover env of 1.5 cannot
+    // reintroduce the overcharge.
+    floorMultiple: Number(opt("X402_FLOOR_MULTIPLE", "1")),
     // THE PRICING CONTRACT, and every knob in it is env-tunable so it can be
     // moved without a redeploy of the image:
     //   X402_RATE_MAX=1     -> never more expensive than OpenRouter direct

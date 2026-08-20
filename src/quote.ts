@@ -238,6 +238,13 @@ export async function quoteRequest(
   // did nothing our cost IS the direct price, the cost floor binds, and the
   // caller pays the 1x ceiling — we cannot discount margin that does not
   // exist, and we do not pretend otherwise.
+  //
+  // THE FLOOR IS AT-COST ONLY. A floorMultiple > 1 used to lift billed above
+  // OpenRouter whenever it bound against forwarded cogs (MEASURED live Claude
+  // spill: billed $0.51 vs direct $0.35 — 1.5 × $0.35). The raw multiple is
+  // clamped to ≤ 1 the same way volumeRate clamps rateMax, then min'd against
+  // our own forwarded cost and the like-for-like direct. It can never outrank
+  // the 1×-direct ceiling.
   const usageRate = volumeRate(tenantSpendUsd, cfg.volume);
 
   // COUNTERFACTUAL PRICING. A markup on the tokens we forward is
@@ -260,7 +267,6 @@ export async function quoteRequest(
     ? openrouterUsd(model.prompt, model.completion, counterfactualTokens, maxOut)
     : null;
   const counterfactual = direct !== null && cfg.discount > 0;
-  const floorUsd = baseUsd * cfg.floorMultiple;
   // The price everything is now quoted against. When leCore compressed, that
   // is the pre-compression body's direct cost; when it did not, `direct` is
   // null and the body we forwarded IS the body they would have bought, so
@@ -272,6 +278,13 @@ export async function quoteRequest(
   // instead of having to choose. The cost floor two lines down is what stops
   // the composition from walking under our own spend.
   const effectiveRate = usageRate * (counterfactual ? cfg.discount : 1);
+  // floorMultiple > 1 must not lift billed above OpenRouter. Clamp the
+  // effective multiple to ≤ 1 (same law as volumeRate's rateMax), then the
+  // dollar floor to min(our forwarded cost, like-for-like direct).
+  const rawFloor = Number.isFinite(cfg.floorMultiple) && cfg.floorMultiple > 0
+    ? baseUsd * cfg.floorMultiple
+    : 0;
+  const floorUsd = Math.min(rawFloor, baseUsd, directUsd);
   // NO CLIFF. The two modes used to be exclusive, which made price
   // NON-MONOTONIC in body size: MEASURED on the live gateway, 40,000 chars
   // billed $0.096426 (markup) while 42,000 chars billed $0.047421
@@ -288,9 +301,10 @@ export async function quoteRequest(
   // Nothing steps, so padding a body past the spill threshold can no longer
   // buy a cheaper price than trimming it.
   //
-  // Read outward-in: a rate off direct, lifted to our own cost floor, then
-  // capped — unconditionally — at direct itself. The cap is last on purpose.
-  // It is the whole contract, and no floor, discount or curve may outrank it.
+  // Read outward-in: a rate off direct, lifted to the at-cost floor (never
+  // a 1.5× lift), then capped — unconditionally — at direct itself. The cap
+  // is last on purpose. It is the whole contract, and no floor, discount or
+  // curve may outrank it.
   const billedUsd = Math.min(Math.max(directUsd * effectiveRate, floorUsd), directUsd);
   const pricedAt = new Date().toISOString();
 

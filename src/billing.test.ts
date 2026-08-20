@@ -22,7 +22,8 @@ process.env.OPENROUTER_TIMEOUT_MS = "800";
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
 
 import type { Quote } from "./quote.js";
-import { reconcileQuote, usageFromCompletion } from "./quote.js";
+import { quoteRequest, reconcileQuote, usageFromCompletion } from "./quote.js";
+import { estimateTokens } from "./math.js";
 import { raceActualCogsUsd, raceActualUsd, racePartConsumed, raceReconcile, type RaceResult } from "./race.js";
 import { prepaidBilledUsd, refundAfterSettle, x402Receipt, type PayInfo } from "./completions.js";
 import { creditEntries, grantCredit, _resetCredits } from "./credits.js";
@@ -384,6 +385,24 @@ upstreamHostHits = 0;
   ok(r.status === 200, "x-ai/* through OpenRouter → 200 (dead xaiUrl was not used)");
   ok(Array.isArray(j.choices), "x-ai/* returns a completion from the OpenRouter mock");
   ok(upstreamHostHits >= 1, "x-ai/* hit the OpenRouter mock, not XAI_URL");
+}
+
+// quoteRequest is the source of truth: a spilled 3/N Claude-session must
+// never bill above direct, even when this fixture still passes floorMultiple 1.5.
+console.log("--- spilled Claude-session billed ≤ direct ---");
+{
+  const hundred = Array.from({ length: 100 }, (_, i) => ({
+    role: i % 2 === 0 ? "user" : "assistant",
+    content: `turn ${i} ` + "context padding ".repeat(40),
+  }));
+  const tail = { model: "m", max_tokens: 256, messages: hundred.slice(-3) };
+  const qSpill = await quoteRequest(cfg, tail, estimateTokens(hundred), 0);
+  ok(qSpill.billedUsd <= (qSpill.directUsd ?? 0) + 1e-12,
+    `spilled 3/N session billed ${qSpill.billedUsd} ≤ direct ${qSpill.directUsd}`);
+  const wouldLift = qSpill.openrouterUsd * 1.5;
+  if (wouldLift > (qSpill.directUsd ?? 0)) {
+    ok(qSpill.billedUsd + 1e-12 < wouldLift, "1.5× floor is not the bill when it would exceed direct");
+  }
 }
 
 gw.close(); mock.close();

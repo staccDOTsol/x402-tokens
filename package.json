@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "selftest": "node dist/selftest.js",
-    "test": "node dist/selftest.js && node dist/spill.test.js && node dist/spillgate.test.js && node dist/race.test.js && node dist/streamrace.test.js && node dist/settleorder.test.js && node dist/billing.test.js && node dist/wrapspec.test.js && node dist/paybuild.test.js",
+    "test": "node dist/selftest.js && node dist/pricing.test.js && node dist/spill.test.js && node dist/spillgate.test.js && node dist/race.test.js && node dist/streamrace.test.js && node dist/settleorder.test.js && node dist/billing.test.js && node dist/wrapspec.test.js && node dist/paybuild.test.js",
     "start": "node bin/x402-tokens.mjs",
     "wrap": "node scripts/wrap-yusdcx.mjs",
     "pay": "node scripts/pay.mjs"
