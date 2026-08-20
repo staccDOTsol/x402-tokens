@@ -4,7 +4,9 @@ import { readFileSync, existsSync } from "node:fs";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "./config.js";
+import { serveRace, serveSingle } from "./completions.js";
 import { complete, listModels } from "./openrouter.js";
+import { parseRace, quoteRaceCeiling, resolveRaceModels, type RaceQuote, type RaceSpec } from "./race.js";
 import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive, quoteMediaLive, quoteUnits } from "./quote.js";
 import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, submitVideo, unitCostUsd } from "./together.js";
@@ -925,10 +927,11 @@ export function createServerFor(cfg: Config) {
       } catch {
         return json(res, 400, { error: "invalid json" });
       }
-      let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean } = anthropic
+      let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean; race?: unknown; race_need?: unknown; tier?: unknown } = anthropic
         ? anthropicToChatBody(parsed) as typeof body
         : parsed as typeof body;
       if (!body.messages) return json(res, 400, { error: "messages required" });
+      const callerSetPlugins = Object.prototype.hasOwnProperty.call(parsed, "plugins");
 
       // WEB SEARCH ON, FOR EVERY MODEL, BY DEFAULT.
       //
@@ -1077,7 +1080,39 @@ export function createServerFor(cfg: Config) {
       // Tenant resolved BEFORE the quote now: the price depends on it. Same
       // key credits.ts and the sidecar partition by.
       const tenantKey = tenantFor(cfg, req);
-      const q = await quoteLive(
+      const counterfactualTokens = Math.max(
+        lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : 0,
+        spillTokensBefore,
+      ) || undefined;
+      const tenantSpendUsd = trailingSpend(tenantKey, cfg.volumeWindowDays);
+      let raceSpec: RaceSpec | null = null;
+      let raceQuote: RaceQuote | undefined;
+      let raceModels: string[] = [];
+      try {
+        raceSpec = parseRace(body);
+      } catch (e) {
+        return json(res, 400, { error: (e as Error).message });
+      }
+      // Race quotes N racers + a judge. Strip the default web plugin unless
+      // the caller set plugins themselves — otherwise the ceiling is N × $0.007.
+      if (raceSpec && !callerSetPlugins) {
+        delete (body as { plugins?: unknown }).plugins;
+        delete (prepped as { plugins?: unknown }).plugins;
+      }
+      if (raceSpec) {
+        try {
+          raceModels = await resolveRaceModels(cfg, raceSpec);
+        } catch (e) {
+          return json(res, 503, { error: (e as Error).message });
+        }
+        if (raceModels.length < 2) {
+          return json(res, 400, { error: "could not resolve enough race models from the catalog" });
+        }
+        raceQuote = await quoteRaceCeiling(cfg, prepped, raceModels, counterfactualTokens, tenantSpendUsd);
+      }
+      const q = raceQuote
+        ? raceQuote.q
+        : await quoteLive(
         cfg,
         prepped,
         // ATTACH prices against the whole bound corpus, not tokensBefore. In
@@ -1087,14 +1122,11 @@ export function createServerFor(cfg: Config) {
         // every attach call fell back to plain markup and reported a saving
         // of exactly 1/markup. SPILL is unchanged: there tokensBefore IS the
         // pre-compression body, which is the right counterfactual.
-        Math.max(
-          lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : 0,
-          spillTokensBefore,
-        ) || undefined,
+        counterfactualTokens,
         // TALK MORE, PAY LESS. What this tenant has already spent here in the
         // trailing window sets the fraction of OpenRouter's own price they
         // pay. A new tenant is at the ceiling (1x direct, never above it).
-        trailingSpend(tenantKey, cfg.volumeWindowDays),
+        tenantSpendUsd,
       );
       const reqs = requirements(cfg, q, resource);
       // one analytics line per chat request, whatever the outcome
@@ -1185,10 +1217,70 @@ export function createServerFor(cfg: Config) {
       // is an OpenRouter-only field (the web-search injection above) and does
       // not exist on xAI's API, so it is dropped on this path.
       const modelId = String((prepped as { model?: string }).model ?? "");
-      const isDirectXai = modelId.startsWith("x-ai/") && !!cfg.xaiKey;
-      const callUpstream = (b: Record<string, unknown>) => isDirectXai
-        ? complete(cfg.xaiUrl, cfg.xaiKey, { ...b, plugins: undefined, model: modelId.slice("x-ai/".length) }, cfg.publicUrl)
-        : complete(cfg.openrouterUrl, cfg.openrouterKey, b, cfg.publicUrl);
+      const callUpstream = (b: Record<string, unknown>, opts?: { signal?: AbortSignal }) => {
+        const mid = String((b as { model?: string }).model ?? modelId);
+        const isDirectXai = mid.startsWith("x-ai/") && !!cfg.xaiKey;
+        return isDirectXai
+          ? complete(cfg.xaiUrl, cfg.xaiKey, { ...b, plugins: undefined, model: mid.slice("x-ai/".length) }, cfg.publicUrl, opts)
+          : complete(cfg.openrouterUrl, cfg.openrouterKey, b, cfg.publicUrl, opts);
+      };
+
+      // /v1/messages stays JSON (Anthropic SSE is a different wire). Stream
+      // on the OpenAI completions door is real SSE. Race is one settle either way.
+      const wantsStream = !anthropic && body.stream === true;
+      const extras = {
+        q,
+        lecoreInfo,
+        shouldHaveEngaged,
+        dedupStripped,
+        pay: {
+          paidByCredit,
+          paidBySub,
+          picked: v.picked,
+          settled,
+          payer: settled.payer ?? v.payer,
+        },
+        spill: spillSent ? { sent: spillSent, total: spillTotal, context_id: headerCtx } : undefined,
+      };
+      const spendTenant = paidBySub ? subTenant : tenantKey;
+      const anthropicModel = anthropic ? String(body.model || cfg.defaultModel) : undefined;
+
+      if (raceSpec && raceQuote) {
+        spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
+        await serveRace(res, {
+          cfg,
+          prepped,
+          wantsStream,
+          callUpstream,
+          tenantKey: spendTenant,
+          q,
+          race: raceSpec,
+          raceQuote,
+          models: raceModels,
+          extras,
+          evt,
+          extraHeaders: ctxHdr,
+          anthropicModel,
+        });
+        return;
+      }
+      if (wantsStream) {
+        spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
+        await serveSingle(res, {
+          cfg,
+          prepped,
+          body: body as Record<string, unknown>,
+          wantsStream,
+          callUpstream,
+          tenantKey: spendTenant,
+          q,
+          extras,
+          evt,
+          extraHeaders: ctxHdr,
+          anthropicModel,
+        });
+        return;
+      }
 
       let out = await callUpstream({ ...prepped, stream: false });
 
@@ -1240,7 +1332,7 @@ export function createServerFor(cfg: Config) {
       // billed amount becomes tenant credit, and the receipt says so.
       const providerErrored = !!(out.json as { error?: unknown })?.error
         && !((out.json as { choices?: unknown[] })?.choices?.length);
-      if (providerErrored && q.billedUsd > 0 && !paidByCredit) {
+      if (providerErrored && q.billedUsd > 0 && !paidByCredit && !paidBySub) {
         grantCredit(tenantKey, q.billedUsd, "provider_error");
       }
       // VOLUME LEDGER. Counts toward the tenant's next price — see spend.ts.

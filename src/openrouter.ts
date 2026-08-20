@@ -13,6 +13,9 @@ interface Cache {
 let cache: Cache | null = null;
 const TTL = 10 * 60_000;
 
+/** Test hook — drop the catalog so the next listModels hits the mock. */
+export function _clearModelCache(): void { cache = null; }
+
 export async function getModel(base: string, key: string, id: string): Promise<ModelPrice> {
   const all = await listModels(base, key);
   const m = all.byId.get(id);
@@ -43,6 +46,7 @@ export async function complete(
   key: string,
   body: unknown,
   referer: string,
+  opts?: { signal?: AbortSignal },
 ): Promise<{ status: number; headers: Headers; stream: ReadableStream<Uint8Array> | null; json?: unknown }> {
   const r = await fetch(`${base}/chat/completions`, {
     method: "POST",
@@ -53,6 +57,7 @@ export async function complete(
       "x-title": "x402-tokens",
     },
     body: JSON.stringify(body),
+    signal: opts?.signal,
   });
   const ctype = r.headers.get("content-type") ?? "";
   if (ctype.includes("text/event-stream") && r.body) {
