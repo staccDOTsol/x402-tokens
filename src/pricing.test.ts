@@ -16,7 +16,7 @@
  * Numbers are the measured 60k-needle cell (70,906 tok direct -> 890 forwarded).
  */
 import { quoteRequest, quoteUnits } from "./quote.js";
-import { volumeRate } from "./math.js";
+import { estimateTokens, volumeRate } from "./math.js";
 import type { Config } from "./config.js";
 
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
@@ -172,11 +172,57 @@ ok(heavy.billedUsd > ourCost, "even at the rate floor we are above our own cost 
 console.log(`  floor-rate one : pays ${usd(heavy.billedUsd)}  profit ${usd(heavy.billedUsd - ourCost)}`);
 
 // Cost floor: a body that barely spilled must not price under cost, and a
-// heavy tenant must not be able to push it there either.
+// heavy tenant must not be able to push it there either. The floor is
+// at-cost only — min(our forwarded cost, direct) — never a 1.5× lift.
 const tinySpill = await quoteRequest(base, forwarded, 900, 50_000);
 ok(tinySpill.flooredAtCost === true, "near-zero spill at the floor rate -> cost floor engages");
-ok(tinySpill.billedUsd >= Math.min(ourCost * base.floorMultiple, tinySpill.directUsd ?? 0) - 1e-12,
-  "cost floor holds (subordinate only to the 1x-direct ceiling)");
+const cappedFloor = Math.min(ourCost, tinySpill.directUsd ?? 0);
+ok(tinySpill.billedUsd >= cappedFloor - 1e-12,
+  "cost floor holds at our own cost (subordinate to the 1x-direct ceiling)");
+ok(tinySpill.billedUsd <= (tinySpill.directUsd ?? 0) + 1e-12, "floored bill still ≤ direct");
+ok(tinySpill.billedUsd <= ourCost + 1e-12, "floored bill still ≤ our forwarded cost");
+ok(tinySpill.billedUsd + 1e-12 < ourCost * base.floorMultiple,
+  "1.5× floorMultiple in Config is not the bill");
+
+// Live cell (Claude spill HUD): forwarded catalog ~$0.35, 1.5× floor wanted
+// ~$0.51, X 0.6768. Prove the cap is STRUCTURAL — Config still passes 1.5.
+ok(ourCost * 1.5 > (tinySpill.directUsd ?? 0),
+  "0.51-vs-0.35 shape: 1.5× forwarded cost exceeds like-for-like direct");
+ok(tinySpill.billedUsd <= (tinySpill.directUsd ?? 0) + 1e-12,
+  `billed ${usd(tinySpill.billedUsd)} ≤ direct ${usd(tinySpill.directUsd ?? 0)}, never the 1.5× lift ${usd(ourCost * 1.5)}`);
+ok(tinySpill.openrouterUsd * 1.5 > (tinySpill.directUsd ?? 0),
+  "old wrong law (billed may sit at ourCost × 1.5) would have exceeded direct");
+
+/* ---------------------------------------------------------------------- *
+ * Spilled Claude-session: 3/N tail vs 100-turn counterfactual.
+ * billedUsd ≤ directUsd. The old wrong law (billed ≤ ourCost × 1.5) is
+ * not a license to sit at 1.5× when that exceeds direct.
+ * ---------------------------------------------------------------------- */
+console.log("\n--- spilled Claude-session billed ≤ direct ---");
+const sessionTurn = (i: number) => ({
+  role: i % 2 === 0 ? "user" : "assistant",
+  content: `turn ${i} ` + "context padding ".repeat(40),
+});
+const hundredTurns = Array.from({ length: 100 }, (_, i) => sessionTurn(i));
+const forwardedTail = {
+  model: "m",
+  max_tokens: 256,
+  messages: hundredTurns.slice(-3),
+};
+const sessionTokens = estimateTokens(hundredTurns);
+ok(sessionTokens > estimateTokens(forwardedTail.messages),
+  "3/N tail is much smaller than the 100-turn counterfactual");
+const spilled = await quoteRequest(base, forwardedTail, sessionTokens, 0);
+ok(spilled.pricing === "counterfactual", "3/N of 100 turns -> counterfactual pricing");
+ok(spilled.billedUsd <= (spilled.directUsd ?? 0) + 1e-12,
+  `spilled Claude-session billed ${usd(spilled.billedUsd)} ≤ direct ${usd(spilled.directUsd ?? 0)}`);
+// The OLD wrong law: billedUsd <= openrouterUsd * max(floorMultiple, 1).
+// That permitted sitting at 1.5 × forwarded cogs. It is not the contract.
+const oldWrongCeiling = spilled.openrouterUsd * Math.max(base.floorMultiple, 1);
+if (oldWrongCeiling > (spilled.directUsd ?? 0) + 1e-12) {
+  ok(spilled.billedUsd <= (spilled.directUsd ?? 0) + 1e-12,
+    "when 1.5× ourCost would exceed direct, billed still ≤ direct (old wrong law discarded)");
+}
 
 // Monotone in BODY SIZE: padding a body must never lower the bill.
 let prevBySize = 0;
