@@ -9,6 +9,16 @@ import { clankerPrompt, renderIndex } from "./page.js";
 import { quoteLive, quoteMediaLive, quoteUnits } from "./quote.js";
 import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, submitVideo, unitCostUsd } from "./together.js";
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
+import {
+  anthropicToChatBody,
+  chatToAnthropicMessage,
+  createSpillStats,
+  hudDollarX,
+  sessionKeyFrom,
+  spillTranscript,
+  type BindFn,
+} from "./spill.js";
+import { acceptSubscription } from "./subpay.js";
 import { challenge, requirements, settle, verify } from "./x402.js";
 import { verifySignedNamespace } from "./nsauth.js";
 import { mintSession, tenantFromSession } from "./session.js";
@@ -265,6 +275,8 @@ const logEvent = (e: Record<string, unknown>) => {
   console.log("evt", JSON.stringify({ ...stored, payer: shortPayer(stored.payer as string | undefined) }));
 };
 
+const spillHud = createSpillStats();
+
 export function createServerFor(cfg: Config) {
   const resource = `${cfg.publicUrl}/v1/chat/completions`;
 
@@ -288,8 +300,8 @@ export function createServerFor(cfg: Config) {
     res.setHeader("access-control-allow-headers",
       "content-type, authorization, x-payment, x-hrr-context, x-hrr-top-k, x-hrr-gate, "
       + "x-openzoo-session, x-openzoo-namespace, x-openzoo-namespace-sig, x-openzoo-namespace-signer, "
-      + "x-openzoo-namespace-ts, x-openzoo-namespace-chain");
-    res.setHeader("access-control-expose-headers", "x-payment-response, x-402-priced-at");
+      + "x-openzoo-namespace-ts, x-openzoo-namespace-chain, x-claude-code-session-id, x-session-id");
+    res.setHeader("access-control-expose-headers", "x-payment-response, x-402-priced-at, x-hrr-context");
     res.setHeader("access-control-max-age", "86400");
     if (req.method === "OPTIONS") {
       res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
@@ -904,14 +916,18 @@ export function createServerFor(cfg: Config) {
       return json(res, status, payload);
     }
 
-    if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+    if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/messages")) {
+      const anthropic = url.pathname === "/v1/messages";
       const raw = await readBody(req);
-      let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean };
+      let parsed: Record<string, unknown>;
       try {
-        body = JSON.parse(raw || "{}");
+        parsed = JSON.parse(raw || "{}");
       } catch {
         return json(res, 400, { error: "invalid json" });
       }
+      let body: { model?: string; messages?: unknown; max_tokens?: number; stream?: boolean } = anthropic
+        ? anthropicToChatBody(parsed) as typeof body
+        : parsed as typeof body;
       if (!body.messages) return json(res, 400, { error: "messages required" });
 
       // WEB SEARCH ON, FOR EVERY MODEL, BY DEFAULT.
@@ -936,15 +952,51 @@ export function createServerFor(cfg: Config) {
       const bodyBytes = Buffer.byteLength(raw);
       const ip = shortIp((req.headers["fly-client-ip"] as string) || req.socket.remoteAddress || undefined);
 
-      // leCore in front. MUST precede quoteLive: the 402 is priced from
-      // estimateTokens(messages), so spilling after the quote would bill the
-      // caller 3x on the whole book and hand them the discount they already
-      // paid for. Thread key lets a caller keep one holographic context.
+      // CLAUDE-CLI SPILL, FOR EVERY CLIENT. Desktop maybeCacheCorpus used to
+      // `return null` the moment x-hrr-context was already set, so grokui
+      // (and anything else that stamped the header) POSTed the full ~850k
+      // transcript × N racers. Phones never spilled at all. Do the cut HERE
+      // — system + last few turns — even when the header is present. Reuse
+      // / append their context id; never skip the stub.
       let headerCtx = req.headers["x-hrr-context"] as string | undefined;
+      const sessionKey = sessionKeyFrom(req.headers as Record<string, string | string[] | undefined>, body as Record<string, unknown>);
+      let spillSent = 0;
+      let spillTotal = 0;
+      let spillTokensBefore = 0;
+      try {
+        const bind: BindFn | undefined = cfg.lecoreUrl
+          ? async (items, contextId) => {
+              const { status, payload } = await bindPassthrough(
+                { ...cfg, lecoreTenant: tenantFor(cfg, req) },
+                { items, context_id: contextId },
+              );
+              if (status < 200 || status >= 300 || !(payload as { context_id?: string }).context_id) return null;
+              rememberChunks((payload as { context_id?: string }).context_id, (payload as { bound?: number }).bound);
+              return payload as { context_id?: string };
+            }
+          : undefined;
+        const spilled = await spillTranscript(body as Record<string, unknown>, {
+          bind,
+          headerCtx,
+          sessionKey,
+          dollarX: hudDollarX(spillHud.snapshot()),
+          log: (line) => console.log("spill", line),
+        });
+        if (spilled) {
+          body = spilled.body as typeof body;
+          if (spilled.contextId) headerCtx = spilled.contextId;
+          spillSent = spilled.sent;
+          spillTotal = spilled.total;
+          spillTokensBefore = spilled.tokensBefore;
+          spillHud.noteSpill({ reused: spilled.reused, sent: spilled.sent });
+        }
+      } catch { /* spill must never take the request down; prepare is next */ }
+
       // ZERO-INTEGRATION DEDUP: clients that never heard of X-HRR-Context but
       // re-send the same fat prefix every call get it bound on sighting #2 and
       // stripped+attached from sighting #3 on. Fail-open by construction —
-      // no match means nothing changes.
+      // no match means nothing changes. Do NOT skip spill above because of
+      // this header: a client-supplied id is a reuse hint, not a skip.
       let dedupStripped = 0;
       if (!headerCtx) {
         try {
@@ -990,9 +1042,14 @@ export function createServerFor(cfg: Config) {
           lecoreInfo = a.info;
         } catch (e) {
           if (e instanceof ContextGoneError) {
-            return json(res, 404, { error: { message: "hrr_context_not_found", code: "context_not_found", context_id: headerCtx } });
+            // Already cut the tail this turn — do not 404 a phone back
+            // onto re-POSTing 850k just because recall missed.
+            if (!spillSent) {
+              return json(res, 404, { error: { message: "hrr_context_not_found", code: "context_not_found", context_id: headerCtx } });
+            }
+          } else {
+            return json(res, 503, { error: (e as Error).message });
           }
-          return json(res, 503, { error: (e as Error).message });
         }
       }
 
@@ -1030,7 +1087,10 @@ export function createServerFor(cfg: Config) {
         // every attach call fell back to plain markup and reported a saving
         // of exactly 1/markup. SPILL is unchanged: there tokensBefore IS the
         // pre-compression body, which is the right counterfactual.
-        lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : undefined,
+        Math.max(
+          lecoreInfo.engaged ? (lecoreInfo.corpusTokens ?? lecoreInfo.tokensBefore) : 0,
+          spillTokensBefore,
+        ) || undefined,
         // TALK MORE, PAY LESS. What this tenant has already spent here in the
         // trailing window sets the fraction of OpenRouter's own price they
         // pay. A new tenant is at the ceiling (1x direct, never above it).
@@ -1063,17 +1123,31 @@ export function createServerFor(cfg: Config) {
       // serves WITHOUT payment. Optimistic consumption — see credits.ts.
       // (tenantKey is resolved above the quote — the price depends on it.)
       let paidByCredit = false;
+      let paidBySub = false;
+      let subTenant = tenantKey;
       if (!header && q.billedUsd > 0 && creditBalance(tenantKey) >= q.billedUsd) {
         applyCredit(tenantKey, q.billedUsd);
         paidByCredit = true;
         evt("credit_used", { billedUsd: q.billedUsd });
       }
+      // Subscription bearer (ozk_live / oz_live / Stripe-style) is not x402.
+      // Store clients already skip the wallet paywall on this header — do
+      // not force a 402 just because we also spilled the transcript.
       if (!header && !paidByCredit) {
-        evt("402_quoted", { billedUsd: q.billedUsd, dedup_stripped: dedupStripped || undefined });
-        return json(res, 402, challenge(cfg, q, resource), { "x-402-priced-at": q.pricedAt });
+        const sub = await acceptSubscription(req.headers.authorization, { baseTenant: cfg.lecoreTenant });
+        if (sub.ok) {
+          paidBySub = true;
+          if (sub.tenant) subTenant = sub.tenant;
+          evt("subscription", { billedUsd: q.billedUsd });
+        }
       }
-      const v = paidByCredit
-        ? { ok: true as const, picked: { asset: "credit", maxAmountRequired: "0" } as never, payer: tenantKey }
+      const ctxHdr: Record<string, string> = headerCtx ? { "x-hrr-context": headerCtx } : {};
+      if (!header && !paidByCredit && !paidBySub) {
+        evt("402_quoted", { billedUsd: q.billedUsd, dedup_stripped: dedupStripped || undefined, spill_sent: spillSent || undefined, spill_total: spillTotal || undefined });
+        return json(res, 402, challenge(cfg, q, resource), { "x-402-priced-at": q.pricedAt, ...ctxHdr });
+      }
+      const v = (paidByCredit || paidBySub)
+        ? { ok: true as const, picked: { asset: paidBySub ? "subscription" : "credit", maxAmountRequired: "0" } as never, payer: paidBySub ? subTenant : tenantKey }
         : await verify(cfg, header as string, reqs);
       if (!v.ok || !v.picked) {
         evt("402_invalid", { reason: (v.reason ?? "invalid payment").slice(0, 200) });
@@ -1090,8 +1164,8 @@ export function createServerFor(cfg: Config) {
       // errors has already settled — the receipt names the tx so it can be
       // made right, which beats free inference on every payment that cannot
       // clear.
-      const settled = paidByCredit
-        ? { success: true, transaction: "credit", payer: tenantKey }
+      const settled = (paidByCredit || paidBySub)
+        ? { success: true, transaction: paidBySub ? "subscription" : "credit", payer: paidBySub ? subTenant : tenantKey }
         : (await settle(cfg, header as string, v.picked).catch((e) => ({ success: false, errorReason: (e as Error).message }))) as
         { success?: boolean; errorReason?: string; transaction?: string; payer?: string };
       console.log("settle", JSON.stringify(settled));
@@ -1100,7 +1174,7 @@ export function createServerFor(cfg: Config) {
         evt("failed_settle", { payer: settled.payer ?? v.payer, reason, billedUsd: q.billedUsd });
         // clean 402, retryable: the client rebuilds (fresh blockhash / topped-up
         // balance) and pays against the re-quote below.
-        return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt });
+        return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt, ...ctxHdr });
       }
 
       // x-ai/* goes straight to xAI, not through OpenRouter's BYOK passthrough
@@ -1173,9 +1247,11 @@ export function createServerFor(cfg: Config) {
       // Skipped on exactly the calls whose money is being handed straight back
       // as credit: that credit gets spent on a later call which IS counted, and
       // counting both would let a provider outage buy a discount twice.
-      if (q.billedUsd > 0 && !(providerErrored && !paidByCredit)) {
-        recordSpend(tenantKey, q.billedUsd, cfg.volumeWindowDays);
+      if (q.billedUsd > 0 && !(providerErrored && !paidByCredit && !paidBySub)) {
+        recordSpend(paidBySub ? subTenant : tenantKey, q.billedUsd, cfg.volumeWindowDays);
       }
+      // Dollar HUD: fold this quote's dollars, never a savesVsDirect multiple.
+      spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
       evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
         payer: settled.payer ?? v.payer,
         upstream: out.status,
@@ -1187,8 +1263,10 @@ export function createServerFor(cfg: Config) {
         cogsUsd: q.openrouterUsd,
         directUsd: q.directUsd,
         tx: settled.transaction, // public on-chain; the receipt a caller can verify themselves
+        spill_sent: spillSent || undefined,
+        spill_total: spillTotal || undefined,
       });
-      return json(res, out.status, {
+      const receipt = {
         ...(out.json as object),
         x402: {
           billedUsd: q.billedUsd,
@@ -1220,11 +1298,17 @@ export function createServerFor(cfg: Config) {
           lecore: lecoreInfo,
           dedup_stripped_chars: dedupStripped || undefined,
           credit: paidByCredit ? { covered: q.billedUsd } : undefined,
-          refund_credit: providerErrored && !paidByCredit
+          subscription: paidBySub ? { covered: q.billedUsd } : undefined,
+          refund_credit: providerErrored && !paidByCredit && !paidBySub
             ? { usd: q.billedUsd, reason: "provider_error", note: "auto-applied to your next calls" }
             : undefined,
+          spill: spillSent ? { sent: spillSent, total: spillTotal, context_id: headerCtx } : undefined,
         },
-      });
+      };
+      const payload = anthropic
+        ? chatToAnthropicMessage(receipt as Record<string, unknown>, String(body.model || cfg.defaultModel))
+        : receipt;
+      return json(res, out.status, payload, ctxHdr);
     }
 
     return json(res, 404, { error: "not found" });

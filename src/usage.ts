@@ -556,6 +556,16 @@ const pct = (now: number, prev: number): number | null =>
   prev > 0 ? Math.round(((now - prev) / prev) * 1000) / 10 : null;
 const roundTo = (n: number, d = 2) => Math.round(n * 10 ** d) / 10 ** d;
 
+/**
+ * Green HUD multiple: directUsd / spentUsd.
+ * Sum the DOLLARS then divide. Never sum savesVsDirect (that field is a
+ * per-call multiple; adding them is meaningless and was a live HUD bug).
+ */
+export function dollarSavingX(directUsd: number, spentUsd: number): number | null {
+  if (!(spentUsd > 0)) return null;
+  return roundTo(directUsd / spentUsd, 2);
+}
+
 function shapeDay(r: DayRow) {
   const quoted = r.quoted_not_paid;
   return {
@@ -572,7 +582,7 @@ function shapeDay(r: DayRow) {
     // Computed HERE, not in the browser, so the site and the in-app HUD can
     // never disagree about margin or the saving multiple.
     marginPct: r.usdPaid > 0 ? roundTo(((r.usdPaid - r.usdCogs) / r.usdPaid) * 100, 1) : null,
-    lecoreSavingX: r.usdPaid > 0 ? roundTo(r.usdDirect / r.usdPaid, 2) : null,
+    lecoreSavingX: dollarSavingX(r.usdDirect, r.usdPaid),
     conversionPct: r.paid + quoted > 0 ? roundTo((r.paid / (r.paid + quoted)) * 100, 1) : null,
     // true when this day was reconstructed from the bounded event ring at boot
     // rather than counted live — the totals are a floor, not a full day.
