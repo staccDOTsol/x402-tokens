@@ -48,10 +48,13 @@ ok(msgs[msgs.length - 1].content === "who is jarett?", "ON: the live ask survive
 ok(String(msgs[0].content).includes("jarett is stacc"), "ON: recalled slice is injected");
 console.log(`\nBILLING: 402 priced on ${on.info.tokensAfter} tok instead of ${on.info.tokensBefore} -> ${(on.info.tokensBefore / on.info.tokensAfter).toFixed(1)}x cheaper, and that ratio is the discount off buying direct`);
 
-// 4. sidecar down -> fail-open, never takes the zoo down
+// 4. sidecar down -> fail-open, never takes the zoo down. MUST still cut:
+// returning the original 850k body is how every racer and every phone died.
 const dead = await prepare({ ...base, lecoreUrl: "http://127.0.0.1:1" } as Config, body as Record<string, unknown>);
-ok(dead.info.engaged === false && dead.body === (body as unknown), "sidecar down: fail-open, body untouched");
-ok(String(dead.info.reason).startsWith("fail-open:"), "sidecar down: reason reported, not silent");
+ok(dead.info.engaged === false, "sidecar down: fail-open (not engaged)");
+ok(String(dead.info.reason).startsWith("fail-open"), "sidecar down: reason reported, not silent");
+ok((dead.body.messages as unknown[]).length < (body.messages as unknown[]).length,
+  `sidecar down: still cuts the tail (${(dead.body.messages as unknown[]).length} < ${(body.messages as unknown[]).length})`);
 
 // 5. LECORE_REQUIRED=1 -> fail-closed
 let threw = false;

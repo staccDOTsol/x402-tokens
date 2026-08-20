@@ -22,6 +22,7 @@
  */
 import type { Config } from "./config.js";
 import { estimateTokens } from "./math.js";
+import { applySpillCut, type Msg as SpillMsg } from "./spill.js";
 
 export interface LecoreResult {
   /** body to forward + price. Unchanged when leCore did not engage. */
@@ -272,7 +273,7 @@ export async function prepare(
     } catch (e) {
       const why = (e as Error).message.slice(0, 120);
       if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
-      return off(`fail-open: ${why}`);
+      return failOpenCut(body, msgs, before, why);
     }
   }
 
@@ -361,8 +362,38 @@ export async function prepare(
   } catch (e) {
     const why = (e as Error).message.slice(0, 120);
     if (cfg.lecoreRequired) throw new Error(`lecore_unavailable: ${why}`);
-    return off(`fail-open: ${why}`);
+    return failOpenCut(body, msgs, before, why);
   }
+}
+
+/** Sidecar down is not a license to forward 850k chars × N racers. */
+function failOpenCut(
+  body: Record<string, unknown>,
+  msgs: Msg[],
+  before: number,
+  why: string,
+): LecoreResult {
+  const cut = applySpillCut(msgs as SpillMsg[]);
+  if (cut.cut > cut.firstSpillable) {
+    const system = cut.messages.slice(0, cut.firstSpillable);
+    const tail = cut.messages.slice(cut.cut);
+    const forwarded = [...system, ...tail];
+    const after = estimateTokens(forwarded);
+    return {
+      body: { ...body, messages: forwarded },
+      info: {
+        engaged: false,
+        reason: `fail-open-cut: ${why}`,
+        tokensBefore: before,
+        tokensAfter: after,
+        spilledTokens: Math.max(0, before - after),
+      },
+    };
+  }
+  return {
+    body,
+    info: { engaged: false, reason: `fail-open: ${why}`, tokensBefore: before, tokensAfter: before },
+  };
 }
 
 /**

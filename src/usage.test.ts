@@ -53,7 +53,8 @@ const roll = u.aggregate(pub);
 ok(roll.totals.paid === 2, "aggregate counts both paid calls");
 ok(roll.totals.usdPaid === 0.0006, `aggregate sums usd to 0.0006 (got ${roll.totals.usdPaid})`);
 ok(roll.totals.avgUsdPerPaidCall === 0.0003, "average per paid call is usd/paid");
-ok(roll.byDay[0].day === "2026-08-14" && roll.byDay[0].paid === 2, "byDay buckets on the UTC day");
+const today = new Date().toISOString().slice(0, 10);
+ok(roll.byDay[0].day === today && roll.byDay[0].paid === 2, "byDay buckets on the UTC day");
 ok(roll.byModel[0].model === "openai/gpt-4o-mini", "byModel names the model");
 
 const merged = u.mergeShards([u.localSummary(), { ...u.localSummary(), machine: "other", callsToday: 3, paidToday: 1, usdPaidToday: 0.001, payersToday: [PAYER.slice(0, 8)], payersTotal: [PAYER.slice(0, 8)] }]);
@@ -70,5 +71,9 @@ ok(fresh.storeInfo().durable === true, "storeInfo says durable when the volume d
 
 const lines = readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
 ok(lines.every((l) => JSON.parse(l).ts), "every persisted line is parseable json with a ts");
+
+ok(u.dollarSavingX(14, 3) === 4.67, "HUD savingX is direct/spent, rounded");
+ok(u.dollarSavingX(10, 1) === 10, "a single call's multiple is fine");
+ok(Math.abs((u.dollarSavingX(14, 3) ?? 0) - (10 + 2)) > 1, "HUD is not the sum of per-call savesVsDirect multiples");
 
 console.log("usage store ok");
