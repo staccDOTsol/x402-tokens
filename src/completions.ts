@@ -5,7 +5,8 @@
  */
 import type { ServerResponse } from "node:http";
 import type { Config } from "./config.js";
-import type { Quote } from "./quote.js";
+import type { Quote, UsageHint } from "./quote.js";
+import { reconcileQuote, usageFromCompletion } from "./quote.js";
 import type { LecoreResult } from "./lecore.js";
 import {
   assistantText, pipeSse, providerErrored, readSseText, sseDone, sseEvent,
@@ -13,7 +14,7 @@ import {
 } from "./stream.js";
 import {
   brainRace, classifyPrompt, judgeModel, parseClassifyScore, parsePairwiseLetter,
-  pairwisePrompt, raceActualUsd, RACE_EVERY_FAILED, RACE_FAILED_CODE,
+  pairwisePrompt, raceReconcile, RACE_EVERY_FAILED, RACE_FAILED_CODE,
   type RaceArrival, type RaceQuote, type RaceResult, type RaceSpec,
 } from "./race.js";
 import { grantCredit } from "./credits.js";
@@ -36,6 +37,10 @@ export interface ReceiptExtras {
   dedupStripped?: number;
   pay: PayInfo;
   spill?: { sent: number; total: number; context_id?: string };
+  /** Reconciled customer price. Quote is a ceiling; this is what we keep. */
+  billedUsd?: number;
+  /** Upstream cost of work that actually ran — never the N+judge quote. */
+  cogsUsd?: number;
   race?: {
     n: number;
     need: number;
@@ -45,6 +50,7 @@ export interface ReceiptExtras {
     statuses?: string[];
     quotedUsd: number;
     actualUsd: number;
+    actualCogsUsd: number;
     unusedUsd: number;
   };
   refundUsd?: number;
@@ -53,8 +59,15 @@ export interface ReceiptExtras {
 
 export function x402Receipt(x: ReceiptExtras): Record<string, unknown> {
   const { q, pay } = x;
-  const billed = x.race ? x.race.actualUsd : q.billedUsd;
   const direct = q.directUsd ?? q.billedUsd;
+  const rawBilled = x.billedUsd ?? x.race?.actualUsd ?? q.billedUsd;
+  // Never bill above direct. The quote already promised this; reconciliation
+  // and the receipt both enforce it so a UI cannot paint COGS>paid from a
+  // leftover ceiling.
+  const billed = Math.min(Math.max(0, rawBilled), direct);
+  const cogs = x.cogsUsd
+    ?? x.race?.actualCogsUsd
+    ?? (x.race ? x.race.actualUsd : q.openrouterUsd);
   const saves = billed > 0 ? direct / billed : (q.savesVsDirect ?? 1);
   return {
     billedUsd: billed,
@@ -66,7 +79,7 @@ export function x402Receipt(x: ReceiptExtras): Record<string, unknown> {
     savedPct: q.directUsd && billed >= 0 ? Math.max(0, 1 - billed / q.directUsd) : q.savedPct,
     savedUsd: q.directUsd != null ? Math.max(0, q.directUsd - billed) : q.savedUsd,
     volume: q.volume,
-    cogsUsd: q.openrouterUsd,
+    cogsUsd: cogs,
     markup: q.pricing === "markup" ? q.markup : undefined,
     paid: pay.picked.asset,
     lecore_fail_open: x.shouldHaveEngaged || undefined,
@@ -132,26 +145,45 @@ export async function runOneModel(
   return { text, out };
 }
 
-function refundUnused(
+/**
+ * Grant prepaid quote back onto tenant credit. Subscription skip-402 never
+ * drew a wallet or local credit, so it is the only path that skips.
+ *
+ * paidByCredit USED to be excluded (`!paidByCredit && !paidBySub`): a 502
+ * after applyCredit ate the prepaid balance and never wrote it back. Refund
+ * unconditionally — including prepaid credit — for provider errors and for
+ * unused ceiling. The unused-racer grant-back (race_unused) stays.
+ */
+export function refundAfterSettle(
   tenantKey: string,
-  _paidByCredit: boolean,
   paidBySub: boolean | undefined,
   quotedUsd: number,
   actualUsd: number,
-  failedAll: boolean,
+  failed: boolean,
+  reasons: { failed: string; unused: string } = { failed: "race_failed", unused: "race_unused" },
 ): { refundUsd: number; refundReason: string } | undefined {
-  // Subscription skip-402 never drew a wallet or local credit for this quote.
   if (paidBySub || quotedUsd <= 0) return undefined;
-  if (failedAll) {
-    grantCredit(tenantKey, quotedUsd, "race_failed");
-    return { refundUsd: quotedUsd, refundReason: "race_failed" };
+  if (failed) {
+    grantCredit(tenantKey, quotedUsd, reasons.failed);
+    return { refundUsd: quotedUsd, refundReason: reasons.failed };
   }
   const unused = Math.max(0, quotedUsd - actualUsd);
   if (unused > 0) {
-    grantCredit(tenantKey, unused, "race_unused");
-    return { refundUsd: unused, refundReason: "race_unused" };
+    grantCredit(tenantKey, unused, reasons.unused);
+    return { refundUsd: unused, refundReason: reasons.unused };
   }
   return undefined;
+}
+
+function asUpstreamError(e: unknown): CompleteResult {
+  const msg = e instanceof Error ? e.message : String(e || "fetch failed");
+  const timedOut = /abort|timeout/i.test(msg);
+  return {
+    status: timedOut ? 504 : 502,
+    headers: new Headers(),
+    stream: null,
+    json: { error: { message: msg || "fetch failed" } },
+  };
 }
 
 function finishJson(
@@ -185,17 +217,52 @@ export async function serveSingle(
 ): Promise<void> {
   const { callUpstream, prepped, wantsStream, tenantKey, q, extras, evt } = args;
   const extraHeaders = args.extraHeaders ?? {};
-  const out = await callUpstream({ ...prepped, stream: wantsStream });
+  let out: CompleteResult;
+  try {
+    out = await callUpstream({
+      ...prepped,
+      stream: wantsStream,
+      ...(wantsStream ? { stream_options: { include_usage: true } } : {}),
+    });
+  } catch (e) {
+    out = asUpstreamError(e);
+  }
 
   if (wantsStream && out.stream && out.status >= 200 && out.status < 300) {
     writeSseHead(res, extraHeaders);
-    await pipeSse(res, out.stream);
-    const receipt = x402Receipt(extras);
+    let usage: UsageHint | undefined;
+    try {
+      usage = await pipeSse(res, out.stream);
+    } catch (e) {
+      const refund = refundAfterSettle(
+        tenantKey, extras.pay.paidBySub, q.billedUsd, 0, true,
+        { failed: "provider_error", unused: "reconcile" },
+      );
+      const receipt = x402Receipt({ ...extras, billedUsd: 0, cogsUsd: 0, ...refund });
+      sseEvent(res, "error", { error: { message: (e as Error).message || "stream failed", code: "upstream_error" } });
+      sseReceipt(res, receipt);
+      sseDone(res);
+      res.end();
+      evt("paid_upstream_error", {
+        payer: extras.pay.payer, upstream: 502, billedUsd: 0, cogsUsd: 0,
+        directUsd: q.directUsd, tx: extras.pay.settled.transaction,
+      });
+      return;
+    }
+    const rec = reconcileQuote(q, usage);
+    const refund = refundAfterSettle(
+      tenantKey, extras.pay.paidBySub, q.billedUsd, rec.billedUsd, false,
+      { failed: "provider_error", unused: "reconcile" },
+    );
+    if (rec.billedUsd > 0) recordSpend(tenantKey, rec.billedUsd, args.cfg.volumeWindowDays);
+    const receipt = x402Receipt({ ...extras, billedUsd: rec.billedUsd, cogsUsd: rec.cogsUsd, ...refund });
     sseReceipt(res, receipt);
     sseDone(res);
     res.end();
-    if (q.billedUsd > 0) recordSpend(tenantKey, q.billedUsd, args.cfg.volumeWindowDays);
-    evt("paid_200", { payer: extras.pay.payer, upstream: out.status, billedUsd: q.billedUsd, cogsUsd: q.openrouterUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction });
+    evt("paid_200", {
+      payer: extras.pay.payer, upstream: out.status, billedUsd: rec.billedUsd,
+      cogsUsd: rec.cogsUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
+    });
     return;
   }
 
@@ -203,24 +270,26 @@ export async function serveSingle(
   if (!wantsStream) {
     const askedTok = Number((prepped as { max_tokens?: number }).max_tokens ?? 256);
     if (emptyTruncated(used) && askedTok < 512) {
-      const retry = await callUpstream({ ...prepped, stream: false, max_tokens: 1024 });
-      if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) used = retry;
+      try {
+        const retry = await callUpstream({ ...prepped, stream: false, max_tokens: 1024 });
+        if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) used = retry;
+      } catch { /* keep the first response */ }
     }
   }
 
   const errored = providerErrored(used.json) || used.status < 200 || used.status >= 300;
-  let refund: { refundUsd: number; refundReason: string } | undefined;
-  if (errored && q.billedUsd > 0 && !extras.pay.paidByCredit && !extras.pay.paidBySub) {
-    grantCredit(tenantKey, q.billedUsd, "provider_error");
-    refund = { refundUsd: q.billedUsd, refundReason: "provider_error" };
+  const rec = errored ? { billedUsd: 0, cogsUsd: 0, unusedUsd: q.billedUsd } : reconcileQuote(q, usageFromCompletion(used.json));
+  const refund = refundAfterSettle(
+    tenantKey, extras.pay.paidBySub, q.billedUsd, rec.billedUsd, errored,
+    { failed: "provider_error", unused: "reconcile" },
+  );
+  if (rec.billedUsd > 0 && !errored) {
+    recordSpend(tenantKey, rec.billedUsd, args.cfg.volumeWindowDays);
   }
-  if (q.billedUsd > 0 && !(errored && !extras.pay.paidByCredit && !extras.pay.paidBySub)) {
-    recordSpend(tenantKey, q.billedUsd, args.cfg.volumeWindowDays);
-  }
-  const receipt = x402Receipt({ ...extras, ...refund });
+  const receipt = x402Receipt({ ...extras, billedUsd: rec.billedUsd, cogsUsd: rec.cogsUsd, ...refund });
   evt(used.status >= 200 && used.status < 300 ? "paid_200" : "paid_upstream_error", {
-    payer: extras.pay.payer, upstream: used.status, billedUsd: q.billedUsd,
-    cogsUsd: q.openrouterUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
+    payer: extras.pay.payer, upstream: used.status, billedUsd: rec.billedUsd,
+    cogsUsd: rec.cogsUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
   });
 
   if (wantsStream) {
@@ -266,33 +335,40 @@ export async function serveRace(
   const id = `chatcmpl-race-${Date.now().toString(36)}`;
   if (wantsStream) writeSseHead(res, extraHeaders);
 
+  const usageByModel = new Map<string, UsageHint>();
   const run = async (model: string, _onDelta: (chunk: string) => void, signal: AbortSignal) => {
-    const { text } = await runOneModel(callUpstream, { ...prepped, model, stream: false }, {
+    const { text, out } = await runOneModel(callUpstream, { ...prepped, model, stream: false }, {
       signal,
       allowEmptyRetry: false,
     });
+    const u = usageFromCompletion(out.json);
+    if (u) usageByModel.set(model, u);
     return text;
   };
 
   const classify = async (messages: unknown, cand: RaceArrival) => {
-    const { text } = await runOneModel(callUpstream, {
+    const { text, out } = await runOneModel(callUpstream, {
       model: judgeModel(),
       messages: [{ role: "user", content: classifyPrompt(messages, cand) }],
       max_tokens: 24,
       plugins: [],
       stream: false,
     }, { allowEmptyRetry: false });
+    const u = usageFromCompletion(out.json);
+    if (u) usageByModel.set(judgeModel(), u);
     return parseClassifyScore(text);
   };
 
   const pairwise = async (messages: unknown, tied: RaceArrival[]) => {
-    const { text } = await runOneModel(callUpstream, {
+    const { text, out } = await runOneModel(callUpstream, {
       model: judgeModel(),
       messages: [{ role: "user", content: pairwisePrompt(messages, tied) }],
       max_tokens: 8,
       plugins: [],
       stream: false,
     }, { allowEmptyRetry: false });
+    const u = usageFromCompletion(out.json);
+    if (u) usageByModel.set(judgeModel(), u);
     return parsePairwiseLetter(text, tied);
   };
 
@@ -306,13 +382,17 @@ export async function serveRace(
     onStatus: wantsStream ? (s) => sseStatus(res, s) : undefined,
   });
 
-  const actualUsd = result.error ? 0 : raceActualUsd(raceQuote.parts, result);
-  const refund = refundUnused(tenantKey, extras.pay.paidByCredit, extras.pay.paidBySub, q.billedUsd, actualUsd, !!result.error);
-  if (q.billedUsd > 0 && !result.error) {
-    recordSpend(tenantKey, actualUsd || q.billedUsd, args.cfg.volumeWindowDays);
+  const actual = result.error ? { billedUsd: 0, cogsUsd: 0 } : raceReconcile(raceQuote.parts, result, usageByModel);
+  // Unused-racer grant-back (race_unused) and all-fail (race_failed). Prepaid
+  // credit is refunded here too — do not skip paidByCredit.
+  const refund = refundAfterSettle(tenantKey, extras.pay.paidBySub, q.billedUsd, actual.billedUsd, !!result.error);
+  if (actual.billedUsd > 0 && !result.error) {
+    recordSpend(tenantKey, actual.billedUsd, args.cfg.volumeWindowDays);
   }
   const receipt = x402Receipt({
     ...extras,
+    billedUsd: actual.billedUsd,
+    cogsUsd: actual.cogsUsd,
     ...refund,
     race: {
       n: race.n,
@@ -322,14 +402,16 @@ export async function serveRace(
       winner: result.model || undefined,
       statuses: result.statusLog,
       quotedUsd: q.billedUsd,
-      actualUsd,
+      actualUsd: actual.billedUsd,
+      actualCogsUsd: actual.cogsUsd,
       unusedUsd: refund?.refundUsd ?? 0,
     },
   });
 
   evt(result.error ? "paid_upstream_error" : "paid_200", {
     payer: extras.pay.payer,
-    billedUsd: result.error ? 0 : actualUsd,
+    billedUsd: actual.billedUsd,
+    cogsUsd: actual.cogsUsd,
     quotedUsd: q.billedUsd,
     race: true,
     winner: result.model,

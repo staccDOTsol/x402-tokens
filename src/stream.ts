@@ -89,17 +89,34 @@ export function writeAnswerSse(res: ServerResponse, opts: {
 export async function pipeSse(
   res: ServerResponse,
   stream: ReadableStream<Uint8Array>,
-): Promise<void> {
+): Promise<{ prompt_tokens?: number; completion_tokens?: number; cost?: number } | undefined> {
   const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let pending = "";
+  let usage: { prompt_tokens?: number; completion_tokens?: number; cost?: number } | undefined;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.length) res.write(value);
+      pending += dec.decode(value, { stream: true });
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.replace(/\r$/, "");
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+        try {
+          const obj = JSON.parse(data) as { usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number } };
+          if (obj.usage && typeof obj.usage === "object") usage = obj.usage;
+        } catch { /* keep-alive or non-JSON */ }
+      }
     }
   } finally {
     try { reader.releaseLock(); } catch { /* already released */ }
   }
+  return usage;
 }
 
 /** Pull assistant text out of an OpenRouter / OpenAI JSON completion. */

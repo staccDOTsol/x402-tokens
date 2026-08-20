@@ -82,6 +82,67 @@ export interface Quote {
    *  estimate against a vendor example rather than a metered token count —
    *  the caller should be able to see that distinction in the 402. */
   priceModel?: string;
+  /** Catalog rates used to form this quote, so reconciliation can reprice
+   *  against tokens the model actually emitted instead of max_tokens. */
+  promptPrice?: number;
+  completionPrice?: number;
+  webUsd?: number;
+}
+
+/** OpenRouter (and OpenAI-shaped) usage block on a completion. */
+export interface UsageHint {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost?: number;
+}
+
+export function usageFromCompletion(json: unknown): UsageHint | undefined {
+  const u = (json as { usage?: UsageHint } | undefined)?.usage;
+  if (!u || typeof u !== "object") return undefined;
+  const prompt = Number(u.prompt_tokens);
+  const completion = Number(u.completion_tokens);
+  const cost = Number(u.cost);
+  const out: UsageHint = {};
+  if (Number.isFinite(prompt) && prompt >= 0) out.prompt_tokens = prompt;
+  if (Number.isFinite(completion) && completion >= 0) out.completion_tokens = completion;
+  if (Number.isFinite(cost) && cost >= 0) out.cost = cost;
+  return out.prompt_tokens != null || out.completion_tokens != null || out.cost != null ? out : undefined;
+}
+
+/**
+ * THE QUOTE IS A CEILING. We settle max_tokens * catalog before the
+ * upstream call (see server.ts). After the model emits, this sets the
+ * real price:
+ *
+ *   cogsUsd  — usage.cost if the provider named it, otherwise catalog
+ *              rates × tokens actually emitted. Never the prepaid
+ *              max_tokens ceiling when we know better.
+ *   billedUsd — the quoted volume/counterfactual formula scaled to that
+ *              actual cost, then capped at the prepaid quote AND at
+ *              direct. Never above what buying the same body direct
+ *              would have cost.
+ */
+export function reconcileQuote(q: Quote, usage?: UsageHint | null): { billedUsd: number; cogsUsd: number; unusedUsd: number } {
+  const quotedCogs = q.openrouterUsd;
+  const directCap = q.directUsd ?? q.billedUsd;
+  let cogsUsd = quotedCogs;
+  if (usage && typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0) {
+    cogsUsd = usage.cost;
+  } else if (
+    q.promptPrice != null && q.completionPrice != null
+    && usage && (usage.completion_tokens != null || usage.prompt_tokens != null)
+  ) {
+    const promptTok = usage.prompt_tokens ?? q.promptTokensEst;
+    const outTok = usage.completion_tokens ?? q.maxOut;
+    cogsUsd = openrouterUsd(q.promptPrice, q.completionPrice, promptTok, outTok) + (q.webUsd ?? 0);
+  }
+  const ratio = quotedCogs > 0 ? Math.min(1, Math.max(0, cogsUsd / quotedCogs)) : 1;
+  const billedUsd = Math.min(q.billedUsd, directCap, q.billedUsd * ratio);
+  return {
+    billedUsd,
+    cogsUsd,
+    unusedUsd: Math.max(0, q.billedUsd - billedUsd),
+  };
 }
 
 /**
@@ -257,6 +318,9 @@ export async function quoteRequest(
     model: modelId,
     promptTokensEst: promptTokens,
     maxOut,
+    promptPrice: model.prompt,
+    completionPrice: model.completion,
+    webUsd,
     openrouterUsd: baseUsd,
     // THE EFFECTIVE multiple over our own forwarded cost, not cfg.markup —
     // which no longer participates in this lane at all. Reporting the config

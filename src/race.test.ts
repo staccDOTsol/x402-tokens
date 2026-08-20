@@ -1,8 +1,9 @@
 /** First-X-back policy: countable answers, last-of-X fallback, race-level fail. */
 import {
   brainRace, isRaceCountable, parseClassifyScore, parseRace, pickRaceWinner,
-  raceLastShip, RACE_EVERY_FAILED,
+  raceActualCogsUsd, raceLastShip, RACE_EVERY_FAILED, type RaceResult,
 } from "./race.js";
+import type { Quote } from "./quote.js";
 
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -101,6 +102,25 @@ function scripted(specMap: Record<string, { text?: string; err?: Error; empty?: 
   ok(statuses.includes("racing 1/2 back…"), "status 1/2");
   ok(statuses.includes("racing 2/2 back…"), "status 2/2");
   ok(statuses.includes("judging…"), "status judging");
+}
+
+{
+  const q = (usd: number): Quote => ({
+    model: "m", promptTokensEst: 1, maxOut: 8, openrouterUsd: usd, markup: 1,
+    billedUsd: usd, pricedAt: "t", accepts: [], pricing: "volume", directUsd: usd,
+  });
+  const parts = [
+    { model: "a", role: "racer" as const, q: q(1) },
+    { model: "b", role: "racer" as const, q: q(1) },
+    { model: "j", role: "judge" as const, q: q(0.2) },
+  ];
+  const result: RaceResult = {
+    text: "x", model: "b", error: false, statusLog: [], judgeUsed: true,
+    launched: ["a", "b"], countable: ["b"], failed: ["a"], aborted: [], usedModels: ["b"],
+  };
+  const cogs = raceActualCogsUsd(parts, result);
+  ok(cogs === 1.2, "cogs is used racer + judge, not the 2.2 ceiling");
+  ok(cogs < 2.2, "cogs is strictly below the N+judge ceiling");
 }
 
 console.log("race policy ok");
