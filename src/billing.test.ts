@@ -25,7 +25,7 @@ import type { Quote } from "./quote.js";
 import { reconcileQuote, usageFromCompletion } from "./quote.js";
 import { raceActualCogsUsd, raceActualUsd, racePartConsumed, raceReconcile, type RaceResult } from "./race.js";
 import { prepaidBilledUsd, refundAfterSettle, x402Receipt, type PayInfo } from "./completions.js";
-import { creditBalance, creditEntries, grantCredit, _resetCredits } from "./credits.js";
+import { creditEntries, grantCredit, _resetCredits } from "./credits.js";
 
 function q(partial: Partial<Quote> & { billedUsd: number; openrouterUsd: number }): Quote {
   return {
@@ -320,9 +320,10 @@ for (const errMode of ["502", "503", "fetchfail"] as const) {
     `${errMode}: billed stays at the prepaid quote`);
   ok((j.x402?.cogsUsd ?? 1) === 0, `${errMode}: cogsUsd is actual (no usage.cost on a provider error)`);
   const applied = creditEntries("zoo").filter((e) => e.reason === "applied").reduce((s, e) => s + e.usd, 0);
+  const folded = creditEntries("zoo").reduce((s, e) => s + e.usd, 0);
   ok(applied < 0, `${errMode}: prepaid credit was drawn (applied=${applied})`);
   ok(refundReasons("zoo").length === 0, `${errMode}: drawn prepaid is not granted back`);
-  ok(creditBalance("zoo") < 5 - 1e-12, `${errMode}: balance stays reduced`);
+  ok(folded < 5 - 1e-12, `${errMode}: ledger balance stays reduced (folded=${folded})`);
 }
 
 // Successful JSON: billed ≤ direct, cogs is usage.cost not the max_tokens ceiling.
@@ -345,7 +346,7 @@ resetLedger();
 grantCredit("zoo", 50, "seed");
 mode = "race";
 {
-  const before = creditBalance("zoo");
+  const before = creditEntries("zoo").reduce((s, e) => s + e.usd, 0);
   const r = await chat({
     messages: [{ role: "user", content: "ping" }], max_tokens: 32,
     race: 4, race_need: 2, tier: "cheap",
@@ -367,8 +368,9 @@ mode = "race";
   ok((x.cogsUsd ?? 9) < (x.quotedUsd ?? 0), "cogsUsd is below the prepaid N+judge ceiling");
   ok(Math.abs((x.cogsUsd ?? 9) - 0.000025) < 1e-12, `cogsUsd is used racers' usage.cost (m2+m3+judge=0.000025, got ${x.cogsUsd})`);
   const applied = creditEntries("zoo").filter((e) => e.reason === "applied").reduce((s, e) => s + e.usd, 0);
+  const folded = creditEntries("zoo").reduce((s, e) => s + e.usd, 0);
   ok(applied < 0, `prepaid was drawn once for the race (applied=${applied})`);
-  ok(creditBalance("zoo") < before - 1e-12, "unused / failed racers do not restore the drawn balance");
+  ok(folded < before - 1e-12, `unused / failed racers do not restore the drawn balance (folded=${folded})`);
 }
 
 // x-ai/* meters through OpenRouter, not the direct-xAI URL.
