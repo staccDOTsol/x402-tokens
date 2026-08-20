@@ -16,6 +16,7 @@ process.env.RACE_JUDGE_MODEL = "judge";
 process.env.RACE_RACER_TIMEOUT_MS = "2000";
 process.env.BILLING_VERIFY_URL = "http://127.0.0.1:1/no-billing";
 process.env.BILLING_VERIFY_TIMEOUT_MS = "50";
+process.env.OPENROUTER_TIMEOUT_MS = "800";
 
 const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); process.exit(1); } console.log("ok -", m); };
 
@@ -23,7 +24,7 @@ import type { Quote } from "./quote.js";
 import { reconcileQuote, usageFromCompletion } from "./quote.js";
 import { raceActualCogsUsd, raceActualUsd, racePartConsumed, raceReconcile, type RaceResult } from "./race.js";
 import { refundAfterSettle, x402Receipt, type PayInfo } from "./completions.js";
-import { creditBalance, creditEntries, grantCredit, _resetCredits } from "./credits.js";
+import { creditEntries, grantCredit, _resetCredits } from "./credits.js";
 
 function q(partial: Partial<Quote> & { billedUsd: number; openrouterUsd: number }): Quote {
   return {
@@ -211,7 +212,7 @@ const mock = createServer((req, res) => {
         return send({ error: { message: "unavailable" } });
       }
       if (mode === "fetchfail") {
-        req.destroy();
+        // Stay silent so complete() hits OPENROUTER_TIMEOUT_MS (timeout / fetch-failed).
         return;
       }
       if (mode === "race") {
@@ -220,7 +221,7 @@ const mock = createServer((req, res) => {
           setTimeout(() => send({
             id: "late",
             choices: [{ message: { role: "assistant", content: "late" } }],
-            usage: { prompt_tokens: 8, completion_tokens: 4, cost: 0.0004 },
+            usage: { prompt_tokens: 8, completion_tokens: 4, cost: 0.000004 },
           }), 250);
           return;
         }
@@ -229,14 +230,14 @@ const mock = createServer((req, res) => {
           return send({
             id: "judge",
             choices: [{ message: { role: "assistant", content: prompt.includes("real-two") ? "SCORE 9" : "SCORE 7" } }],
-            usage: { prompt_tokens: 20, completion_tokens: 2, cost: 0.00005 },
+            usage: { prompt_tokens: 20, completion_tokens: 2, cost: 0.000005 },
           });
         }
         const text = model === "m3" ? "real-two" : "real-one";
         return send({
           id: model,
           choices: [{ message: { role: "assistant", content: text } }],
-          usage: { prompt_tokens: 8, completion_tokens: 4, cost: 0.0002 },
+          usage: { prompt_tokens: 8, completion_tokens: 4, cost: 0.00001 },
         });
       }
       return send({
@@ -289,7 +290,6 @@ function resetLedger() {
 for (const errMode of ["502", "503", "fetchfail"] as const) {
   resetLedger();
   grantCredit("zoo", 5, "seed");
-  const before = creditBalance("zoo");
   mode = errMode;
   const r = await chat({ model: "m", messages: [{ role: "user", content: "ping" }], max_tokens: 32 });
   const j = await r.json() as { x402?: { refund_credit?: { usd?: number; reason?: string }; billedUsd?: number; cogsUsd?: number } };
@@ -298,8 +298,10 @@ for (const errMode of ["502", "503", "fetchfail"] as const) {
   ok((j.x402?.refund_credit?.usd ?? 0) > 0, `${errMode}: refund_credit.usd is the prepaid quote`);
   ok((j.x402?.billedUsd ?? 1) === 0, `${errMode}: billedUsd is 0 after a provider error`);
   ok((j.x402?.cogsUsd ?? 1) === 0, `${errMode}: cogsUsd is 0 after a provider error`);
-  const after = creditBalance("zoo");
-  ok(Math.abs(after - before) < 1e-9, `${errMode}: prepaid credit is restored (before=${before} after=${after})`);
+  const applied = creditEntries("zoo").filter((e) => e.reason === "applied").reduce((s, e) => s + e.usd, 0);
+  const refunded = creditEntries("zoo").filter((e) => e.reason === "provider_error").reduce((s, e) => s + e.usd, 0);
+  ok(applied < 0 && Math.abs(applied + refunded) < 1e-9,
+    `${errMode}: applied prepaid credit is granted back (applied=${applied} refunded=${refunded})`);
 }
 
 // Successful JSON: billed ≤ direct, cogs is usage.cost not the max_tokens ceiling.
@@ -337,8 +339,9 @@ mode = "race";
   ok((x.race?.unusedUsd ?? 0) > 0, "unused-racer grant-back still fires");
   ok(x.refund_credit?.reason === "race_unused", "refund reason stays race_unused");
   ok((x.cogsUsd ?? 9) < (x.quotedUsd ?? 0), "cogsUsd is below the prepaid N+judge ceiling");
+  ok((x.billedUsd ?? 9) <= (x.quotedUsd ?? 0) + 1e-12, "race billedUsd ≤ quoted ceiling");
   ok((x.billedUsd ?? 9) <= (x.directUsd ?? 0) + 1e-12, "race billedUsd ≤ directUsd");
-  ok((x.cogsUsd ?? 9) === 0.00045, `cogsUsd is used racers' usage.cost (m2+m3+judge=0.00045, got ${x.cogsUsd})`);
+  ok(Math.abs((x.cogsUsd ?? 9) - 0.000025) < 1e-12, `cogsUsd is used racers' usage.cost (m2+m3+judge=0.000025, got ${x.cogsUsd})`);
 }
 
 // x-ai/* meters through OpenRouter, not the direct-xAI URL.

@@ -41,6 +41,19 @@ export async function listModels(base: string, key: string): Promise<Cache> {
   return cache;
 }
 
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal | undefined {
+  if (!(ms > 0) || !Number.isFinite(ms)) return signal;
+  const t = AbortSignal.timeout(ms);
+  if (!signal) return t;
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([signal, t]);
+  const c = new AbortController();
+  const kill = () => c.abort();
+  if (signal.aborted || t.aborted) { c.abort(); return c.signal; }
+  signal.addEventListener("abort", kill, { once: true });
+  t.addEventListener("abort", kill, { once: true });
+  return c.signal;
+}
+
 export async function complete(
   base: string,
   key: string,
@@ -48,6 +61,7 @@ export async function complete(
   referer: string,
   opts?: { signal?: AbortSignal },
 ): Promise<{ status: number; headers: Headers; stream: ReadableStream<Uint8Array> | null; json?: unknown }> {
+  const timeoutMs = Number(process.env.OPENROUTER_TIMEOUT_MS || 120_000);
   const r = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
@@ -57,7 +71,7 @@ export async function complete(
       "x-title": "x402-tokens",
     },
     body: JSON.stringify(body),
-    signal: opts?.signal,
+    signal: withTimeout(opts?.signal, timeoutMs),
   });
   const ctype = r.headers.get("content-type") ?? "";
   if (ctype.includes("text/event-stream") && r.body) {
