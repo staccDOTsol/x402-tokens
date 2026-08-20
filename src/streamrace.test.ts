@@ -9,7 +9,7 @@
  *   4. billing/credit is charged once for the race, not per racer
  */
 import { createServer } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -231,7 +231,10 @@ reset(); raceMode = "mixed";
 
 // Store subscription: ozk_live skips 402 (no wallet, no local credit required).
 // One accept covers the whole race — do not N-charge or N-402.
+// Wipe the ledger: the previous case granted credit to the shared "zoo"
+// tenant, and credit-before-sub would otherwise 200 for the wrong reason.
 reset(); raceMode = "mixed";
+writeFileSync(process.env.CREDITS_PATH as string, "");
 _resetCredits();
 {
   const r = await fetch(chatUrl, {
@@ -242,9 +245,15 @@ _resetCredits();
       race: 4, race_need: 2, tier: "cheap",
     }),
   });
-  const j = await r.json() as { choices?: unknown[]; x402?: { subscription?: unknown; billedUsd?: number } };
+  const j = await r.json() as {
+    choices?: unknown[];
+    x402?: { subscription?: unknown; credit?: unknown; settle?: { transaction?: string } };
+  };
   ok(r.status === 200, "ozk_live bearer skips 402 on a race");
   ok(Array.isArray(j.choices), "subscription race returns a completion");
+  ok(!!j.x402?.subscription, "receipt is subscription, not leftover zoo credit");
+  ok(!j.x402?.credit, "shared-tenant credit was not drawn");
+  ok(j.x402?.settle?.transaction === "subscription", "settle row is subscription");
   ok(settleCount === 0, "subscription never x402-settles");
   const racerCalls = (upstreamByModel.m1 || 0) + (upstreamByModel.m2 || 0) + (upstreamByModel.m3 || 0) + (upstreamByModel.m4 || 0);
   ok(racerCalls >= 3, `several racers launched (${racerCalls}) under one subscription accept`);
