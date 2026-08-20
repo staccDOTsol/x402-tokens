@@ -163,11 +163,24 @@ const BY_MINT: Record<string, WrapAcquire> = {
   [YUSDCX_MINT]: YUSDCX_ACQUIRE,
   [WTOKENX2_MINT]: WTOKENX2_ACQUIRE,
   [WLEOSX_MINT]: WLEOSX_ACQUIRE,
-  [WTOKENX_DRAINED_MINT]: WTOKENX_DRAINED_ACQUIRE,
+  // Drained Bo7x is never a current accepts[] row — remap to wTOKENx2.
 };
+
+/**
+ * TOKEN 402 rows must settle wTOKENx2 at FXYkw…, never drained wTOKENx Bo7x….
+ * Pure so tests can cover Fly env drift (MEME_MINT=FXYkw + MEME_SYMBOL=wTOKENx)
+ * without OPENROUTER_API_KEY / loadConfig().
+ */
+export function normalizeMemeRail(mint: string, symbol: string): { mint: string; symbol: string } {
+  if (mint === WTOKENX_DRAINED_MINT || mint === WTOKENX2_MINT) {
+    return { mint: WTOKENX2_MINT, symbol: "wTOKENx2" };
+  }
+  return { mint, symbol: symbol || "wTOKENx2" };
+}
 
 /** Recipe for a 402 extra.acquire, or a steps-only fallback for unknown twins. */
 export function acquireForMint(mint: string, symbol?: string): WrapAcquire | undefined {
+  if (mint === WTOKENX_DRAINED_MINT) return BY_MINT[WTOKENX2_MINT];
   if (BY_MINT[mint]) return BY_MINT[mint];
   if (symbol && /^(yUSDCx|wTOKENx2?|wLEOSx)$/.test(symbol)) return splTokenWrapAcquire();
   return undefined;
@@ -183,13 +196,15 @@ export function isStaleTransferThenWrapSteps(steps: unknown): boolean {
 
 export function solanaWrap402Help(underlyingNames: string, facilitator: string): string {
   return (
-    `Pay in ${underlyingNames}. Solana wrap of raw USDC/TOKEN/LEOS is a single ` +
+    `Pay in ${underlyingNames}. TOKEN settles as wTOKENx2 ${WTOKENX2_MINT} ` +
+    `(escrow ${WTOKENX2_ACQUIRE.escrow}). Solana wrap of raw USDC/TOKEN/LEOS is a single ` +
     `9-account Wrap on ${WRAP_NAV_PROGRAM} (data = ${WRAP_IX_DATA}); the program ` +
     `CPIs the deposit — do not send a separate TransferChecked or a 5-account Wrap, ` +
-    `that dies NotEnoughAccounts (0x6a) at need(accounts, 9)?. extra.acquire.steps ` +
-    `is the recipe. Don't hold any yet? ${facilitator}/start. Each accepts[] row ` +
-    `carries extra.decimals — maxAmountRequired is already in that asset's raw ` +
-    `units, do not rescale it.`
+    `that dies NotEnoughAccounts (0x6a) at need(accounts, 9)?. A 5-account Wrap of ` +
+    `drained wTOKENx ${WTOKENX_DRAINED_MINT} is an outdated client — install ` +
+    `openzoo@0.49.5 / grokui 1.5.82+. extra.acquire.steps is the recipe. Don't hold ` +
+    `any yet? ${facilitator}/start. Each accepts[] row carries extra.decimals — ` +
+    `maxAmountRequired is already in that asset's raw units, do not rescale it.`
   );
 }
 
@@ -204,7 +219,8 @@ No separate TransferChecked. Account 4 vs 8 are not interchangeable. A 5-account
 
 - USDC → yUSDCx ${YUSDCX_MINT} escrow ${YUSDCX_ACQUIRE.escrow}
 - TOKEN → wTOKENx2 ${WTOKENX2_MINT} escrow ${WTOKENX2_ACQUIRE.escrow}
-  (replaces drained Bo7xBF7SY8EyUBPUxRP66SFafxoPf2n5uqiLjbxEebx9 / escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q)
+  (drained wTOKENx ${WTOKENX_DRAINED_MINT} / escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q is not current)
+A 5-account Wrap of that drained mint is an outdated client. Install openzoo@0.49.5 / grokui 1.5.82+.
 Unwrap: 9 accounts, account 8 = unwrapped token program; prepend underlying ATA idempotent create.
 
 Both wraps are Token-2022 with a 20bps transfer tax. Yield is that tax.`;

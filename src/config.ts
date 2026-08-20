@@ -1,5 +1,6 @@
 /** Env-driven config. Secrets never live in the repo. */
 import type { VolumeCurve } from "./math.js";
+import { normalizeMemeRail } from "./wrapspec.js";
 
 export interface Asset {
   symbol: string;
@@ -266,12 +267,13 @@ export function loadConfig(): Config {
   // Wrapped memecoin is OFF until the mint exists and the facilitator
   // allowlists it. Setting MEME_MINT is what turns the rail on.
   if (process.env.MEME_MINT) {
+    const meme = normalizeMemeRail(process.env.MEME_MINT, opt("MEME_SYMBOL", "wTOKENx2"));
     assets.push({
-      symbol: opt("MEME_SYMBOL", "wTOKENx"),
-      mint: process.env.MEME_MINT,
+      symbol: meme.symbol,
+      mint: meme.mint,
       decimals: Number(opt("MEME_DECIMALS", "6")),
       feeBps: Number(opt("MEME_FEE_BPS", "20")),
-      priceMint: opt("MEME_UNDERLYING", process.env.MEME_MINT),
+      priceMint: opt("MEME_UNDERLYING", meme.mint),
     });
   }
   // LEOS, on the same terms as TOKEN. Off until LEOS_MINT is set, exactly like

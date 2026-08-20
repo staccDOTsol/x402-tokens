@@ -140,7 +140,7 @@ export function underlyingNames(cfg: Config): string {
     // wrapper ticker -> what the holder actually brought
     const under = /^yUSDCx$/.test(a.symbol) ? "USDC"
       : /^wUSDGx$/.test(a.symbol) ? "USDG"
-      : /^wTOKENx$/.test(a.symbol) ? "TOKEN"
+      : /^wTOKENx2?$/.test(a.symbol) ? "TOKEN"
       : a.symbol;
     seen.add(`${under} on ${chain}`);
   }
