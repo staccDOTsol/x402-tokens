@@ -91,12 +91,9 @@ export interface Config {
    *  api.together.ai. Separate field because the /v1 video route exists,
    *  accepts requests, and fails every model. */
   togetherVideoUrl: string;
-  /** x-ai/* models route here directly instead of through OpenRouter's BYOK
-   *  passthrough, which 400s with an invalid xAI key it doesn't control.
-   *  Pricing is untouched — quoteLive still reads OpenRouter's catalog price
-   *  for the model id, which is what the customer is billed regardless of
-   *  which upstream actually serves the completion. Empty -> x-ai/* falls
-   *  back to OpenRouter (today's broken behavior), not a hard failure. */
+  /** Kept for env compat. x-ai/* is no longer routed here — every text
+   *  completion meters through OpenRouter so there is one bill and one
+   *  COGS path. Empty or set, it does not change routing. */
   xaiKey: string;
   xaiUrl: string;
   defaultModel: string;

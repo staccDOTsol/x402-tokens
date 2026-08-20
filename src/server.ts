@@ -13,7 +13,6 @@ import { generateImage, getMedia, listMedia, normalizeResolution, pollVideo, sub
 import { ablatePassthrough, attach, bindPassthrough, ContextGoneError, lecoreCall, memorySearch, memoryWrite, prepare, type LecoreResult } from "./lecore.js";
 import {
   anthropicToChatBody,
-  chatToAnthropicMessage,
   createSpillStats,
   hudDollarX,
   sessionKeyFrom,
@@ -678,10 +677,10 @@ export function createServerFor(cfg: Config) {
       // as the text lane — we cannot un-settle on chain, so the tenant carries
       // the balance forward instead of eating our outage.
       if (out.status < 200 || out.status >= 300) {
-        if (q.billedUsd > 0 && !paidByCredit) {
+        if (q.billedUsd > 0) {
           grantCredit(tenantKey, q.billedUsd, `${kind} upstream ${out.status}`);
         }
-        evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: !paidByCredit });
+        evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: true });
         return json(res, out.status, out.json);
       }
       // Media spend counts toward the text lane's volume curve. It is real
@@ -1209,21 +1208,12 @@ export function createServerFor(cfg: Config) {
         return json(res, 402, challenge(cfg, q, resource, `payment failed: ${reason}`), { "x-402-priced-at": q.pricedAt, ...ctxHdr });
       }
 
-      // x-ai/* goes straight to xAI, not through OpenRouter's BYOK passthrough
-      // (which 400s on a key it doesn't control — measured, see credits.ts).
-      // Pricing is untouched: quoteRequest/quoteLive already read OpenRouter's
-      // catalog price for this model id, and that is what the caller is
-      // billed regardless of which upstream serves the completion. `plugins`
-      // is an OpenRouter-only field (the web-search injection above) and does
-      // not exist on xAI's API, so it is dropped on this path.
-      const modelId = String((prepped as { model?: string }).model ?? "");
-      const callUpstream = (b: Record<string, unknown>, opts?: { signal?: AbortSignal }) => {
-        const mid = String((b as { model?: string }).model ?? modelId);
-        const isDirectXai = mid.startsWith("x-ai/") && !!cfg.xaiKey;
-        return isDirectXai
-          ? complete(cfg.xaiUrl, cfg.xaiKey, { ...b, plugins: undefined, model: mid.slice("x-ai/".length) }, cfg.publicUrl, opts)
-          : complete(cfg.openrouterUrl, cfg.openrouterKey, b, cfg.publicUrl, opts);
-      };
+      // One bill, one meter: every model — including x-ai/* — goes through
+      // OpenRouter. A separate direct-xAI hop billed a second time and
+      // painted its own COGS. XAI_API_KEY is kept on Config for env compat
+      // but is no longer a routing input.
+      const callUpstream = (b: Record<string, unknown>, opts?: { signal?: AbortSignal }) =>
+        complete(cfg.openrouterUrl, cfg.openrouterKey, b, cfg.publicUrl, opts);
 
       // /v1/messages stays JSON (Anthropic SSE is a different wire). Stream
       // on the OpenAI completions door is real SSE. Race is one settle either way.
@@ -1264,143 +1254,22 @@ export function createServerFor(cfg: Config) {
         });
         return;
       }
-      if (wantsStream) {
-        spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
-        await serveSingle(res, {
-          cfg,
-          prepped,
-          body: body as Record<string, unknown>,
-          wantsStream,
-          callUpstream,
-          tenantKey: spendTenant,
-          q,
-          extras,
-          evt,
-          extraHeaders: ctxHdr,
-          anthropicModel,
-        });
-        return;
-      }
-
-      let out = await callUpstream({ ...prepped, stream: false });
-
-      // PAID-FOR-SILENCE GUARD. A reasoning model can spend the WHOLE
-      // max_tokens budget on hidden reasoning and get truncated before it
-      // emits one visible character. REPRODUCED: google/gemini-3.7-flash,
-      // max_tokens=20, prompt "Reply with exactly the word ALIVE" ->
-      // content:"" finish_reason:"length" completion_tokens:17 with 251 chars
-      // of reasoning; at max_tokens=200 the same call answers "ALIVE". Users
-      // saw ~1/3 of calls come back empty, each one billed (one liveness probe
-      // cost $0.039 and returned nothing).
-      //
-      // We settle BEFORE the upstream call, on purpose (see above), so the
-      // money is already taken and a refund is not on the table. The honest
-      // remedy is to deliver what was paid for: retry ONCE with real headroom
-      // and eat the extra upstream cost ourselves. Only on the exact signature
-      // -- empty content AND finish_reason "length" -- so a legitimately empty
-      // answer or a stop-finished one is never re-run.
-      const emptyTruncated = (r: { status: number; json?: unknown }) => {
-        if (r.status < 200 || r.status >= 300) return false;
-        const ch = ((r.json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> })
-          ?.choices ?? [])[0];
-        return !!ch && ch.finish_reason === "length" && !(ch.message?.content || "").trim();
-      };
-      // ONLY RETRY WHEN THE CAP WAS PLAUSIBLY THE PROBLEM. The first version of
-      // this guard fired on ANY empty+length and re-ran at 4x max_tokens up to
-      // 4096. On an agent asking for a multi-file emission that DOUBLED an
-      // already-slow call: measured on the ttfx port, a 4000-token request
-      // against a 396k-token bound context returned empty, and the next step
-      // hung past 900s and killed the harness. A repair that can double the
-      // slowest call in the system is worse than the failure it repairs.
-      //
-      // So: retry only a SMALL cap (where reasoning genuinely eats the whole
-      // budget before any visible token), bound the bump absolutely, and never
-      // fire when the caller already asked for room.
-      const askedTok = Number((prepped as { max_tokens?: number }).max_tokens ?? 256);
-      if (emptyTruncated(out) && askedTok < 512) {
-        const roomier = 1024;
-        console.log("retry", JSON.stringify({ reason: "empty_truncated", asked: askedTok, roomier }));
-        const retry = await callUpstream({ ...prepped, stream: false, max_tokens: roomier });
-        if (!emptyTruncated(retry) && retry.status >= 200 && retry.status < 300) out = retry;
-      } else if (emptyTruncated(out)) {
-        // Large caps: do NOT re-run. Say so in the response instead of
-        // returning a silent void the caller pays for and cannot diagnose.
-        console.log("empty_large_cap", JSON.stringify({ asked: askedTok }));
-      }
-
-      // Upstream handed back an error object after we took payment: full
-      // billed amount becomes tenant credit, and the receipt says so.
-      const providerErrored = !!(out.json as { error?: unknown })?.error
-        && !((out.json as { choices?: unknown[] })?.choices?.length);
-      if (providerErrored && q.billedUsd > 0 && !paidByCredit && !paidBySub) {
-        grantCredit(tenantKey, q.billedUsd, "provider_error");
-      }
-      // VOLUME LEDGER. Counts toward the tenant's next price — see spend.ts.
-      // Skipped on exactly the calls whose money is being handed straight back
-      // as credit: that credit gets spent on a later call which IS counted, and
-      // counting both would let a provider outage buy a discount twice.
-      if (q.billedUsd > 0 && !(providerErrored && !paidByCredit && !paidBySub)) {
-        recordSpend(paidBySub ? subTenant : tenantKey, q.billedUsd, cfg.volumeWindowDays);
-      }
-      // Dollar HUD: fold this quote's dollars, never a savesVsDirect multiple.
+      // JSON and SSE share one billing path (refunds, reconcile, honest cogs).
       spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
-      evt(out.status >= 200 && out.status < 300 ? "paid_200" : "paid_upstream_error", {
-        payer: settled.payer ?? v.payer,
-        upstream: out.status,
-        billedUsd: q.billedUsd,
-        // WHAT IT COST US, and WHAT IT WOULD HAVE COST THE CALLER DIRECT.
-        // Without these two the usage store can only ever answer "revenue" —
-        // margin and the leCore saving are unrecoverable after the fact,
-        // because both are derived from the quote and the quote is gone.
-        cogsUsd: q.openrouterUsd,
-        directUsd: q.directUsd,
-        tx: settled.transaction, // public on-chain; the receipt a caller can verify themselves
-        spill_sent: spillSent || undefined,
-        spill_total: spillTotal || undefined,
+      await serveSingle(res, {
+        cfg,
+        prepped,
+        body: body as Record<string, unknown>,
+        wantsStream,
+        callUpstream,
+        tenantKey: spendTenant,
+        q,
+        extras,
+        evt,
+        extraHeaders: ctxHdr,
+        anthropicModel,
       });
-      const receipt = {
-        ...(out.json as object),
-        x402: {
-          billedUsd: q.billedUsd,
-          pricing: q.pricing,
-          directUsd: q.directUsd,
-          // savesVsDirect is a MULTIPLE (2 = you paid half). It is now always
-          // >= 1 because billedUsd <= directUsd by construction — it used to
-          // read 0.3333 on every flat-3x call, which any UI rendering it as a
-          // saving turned into a 3x overcharge displayed as a win. The three
-          // fields below are the unambiguous fractions; prefer them.
-          savesVsDirect: q.savesVsDirect,
-          rate: q.rate,
-          savedPct: q.savedPct,
-          savedUsd: q.savedUsd,
-          // WHY this rate: trailing spend, the curve's floor, the window.
-          // A caller can see what more usage buys instead of guessing.
-          volume: q.volume,
-          // OUR upstream cost. Clients were deriving it as billedUsd/markup,
-          // which is only right on a straight-markup call: under counterfactual
-          // pricing billedUsd is min(direct×discount, markupUsd), so that
-          // division understates cost and overstates margin. Report it instead
-          // of making every client re-derive it wrongly.
-          cogsUsd: q.openrouterUsd,
-          markup: q.pricing === "markup" ? q.markup : undefined,
-          paid: v.picked.asset,
-          lecore_fail_open: shouldHaveEngaged || undefined,
-          amount: v.picked.maxAmountRequired,
-          settle: settled,
-          lecore: lecoreInfo,
-          dedup_stripped_chars: dedupStripped || undefined,
-          credit: paidByCredit ? { covered: q.billedUsd } : undefined,
-          subscription: paidBySub ? { covered: q.billedUsd } : undefined,
-          refund_credit: providerErrored && !paidByCredit && !paidBySub
-            ? { usd: q.billedUsd, reason: "provider_error", note: "auto-applied to your next calls" }
-            : undefined,
-          spill: spillSent ? { sent: spillSent, total: spillTotal, context_id: headerCtx } : undefined,
-        },
-      };
-      const payload = anthropic
-        ? chatToAnthropicMessage(receipt as Record<string, unknown>, String(body.model || cfg.defaultModel))
-        : receipt;
-      return json(res, out.status, payload, ctxHdr);
+      return;
     }
 
     return json(res, 404, { error: "not found" });

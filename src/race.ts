@@ -15,8 +15,8 @@
  * PING agent protocol.
  */
 import type { Config } from "./config.js";
-import type { Quote } from "./quote.js";
-import { mergeQuotes, quoteLive } from "./quote.js";
+import type { Quote, UsageHint } from "./quote.js";
+import { mergeQuotes, quoteLive, reconcileQuote } from "./quote.js";
 import { listModels } from "./openrouter.js";
 
 export const RACE_EVERY_FAILED = "(race: every model failed — no reply)";
@@ -384,27 +384,52 @@ export function parsePairwiseLetter(verdict: string, tied: RaceArrival[]): RaceA
   return tied[hit.charCodeAt(0) - 65];
 }
 
+/** True when this race part actually ran (and so has a real cost). Failed /
+ *  aborted racers that never produced a countable answer are unused. */
+export function racePartConsumed(
+  p: { model: string; role: "racer" | "judge" },
+  result: RaceResult,
+): boolean {
+  if (p.role === "judge") return result.judgeUsed;
+  if (result.failed.includes(p.model) && !result.countable.includes(p.model)) return false;
+  if (result.aborted.includes(p.model) && !result.countable.includes(p.model) && !result.usedModels.includes(p.model)) return false;
+  if (result.launched.includes(p.model) && (result.countable.includes(p.model) || result.usedModels.includes(p.model))) return true;
+  // Launched and finished with a 2xx (even if not in the first-X set): still consumed.
+  return result.launched.includes(p.model) && !result.failed.includes(p.model) && !result.aborted.includes(p.model);
+}
+
 /** USD actually consumed from a race ceiling, for the unused-credit refund. */
 export function raceActualUsd(
   parts: Array<{ model: string; q: Quote; role: "racer" | "judge" }>,
   result: RaceResult,
 ): number {
-  let usd = 0;
+  return parts.filter((p) => racePartConsumed(p, result)).reduce((s, p) => s + p.q.billedUsd, 0);
+}
+
+/** Upstream cost of the racers (and judge) that actually ran — never the
+ *  prepaid N+judge quote ceiling. That ceiling is what we settle; this is
+ *  what we spent. Painting the ceiling as cogsUsd makes every unused-racer
+ *  refund look like COGS > paid. */
+export function raceActualCogsUsd(
+  parts: Array<{ model: string; q: Quote; role: "racer" | "judge" }>,
+  result: RaceResult,
+): number {
+  return parts.filter((p) => racePartConsumed(p, result)).reduce((s, p) => s + p.q.openrouterUsd, 0);
+}
+
+/** Reprice each consumed part against tokens/cost the model emitted. */
+export function raceReconcile(
+  parts: Array<{ model: string; q: Quote; role: "racer" | "judge" }>,
+  result: RaceResult,
+  usageByModel?: Map<string, UsageHint>,
+): { billedUsd: number; cogsUsd: number } {
+  let billedUsd = 0;
+  let cogsUsd = 0;
   for (const p of parts) {
-    if (p.role === "judge") {
-      if (result.judgeUsed) usd += p.q.billedUsd;
-      continue;
-    }
-    if (result.failed.includes(p.model) && !result.countable.includes(p.model)) continue;
-    if (result.aborted.includes(p.model) && !result.countable.includes(p.model) && !result.usedModels.includes(p.model)) continue;
-    if (result.launched.includes(p.model) && (result.countable.includes(p.model) || result.usedModels.includes(p.model))) {
-      usd += p.q.billedUsd;
-      continue;
-    }
-    // Launched and finished with a 2xx (even if not in the first-X set): still consumed.
-    if (result.launched.includes(p.model) && !result.failed.includes(p.model) && !result.aborted.includes(p.model)) {
-      usd += p.q.billedUsd;
-    }
+    if (!racePartConsumed(p, result)) continue;
+    const rec = reconcileQuote(p.q, usageByModel?.get(p.model));
+    billedUsd += rec.billedUsd;
+    cogsUsd += rec.cogsUsd;
   }
-  return usd;
+  return { billedUsd, cogsUsd };
 }
