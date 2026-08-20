@@ -54,6 +54,6 @@ npm run selftest
 node bin/x402-tokens.mjs
 ```
 
-`scripts/wrap-yusdcx.mjs` wraps USDC → yUSDCx. `scripts/pay.mjs` does the paid call. Both read `~/jjj.json`.
+`scripts/wrap-yusdcx.mjs` wraps USDC → yUSDCx with the post-exploit 9-account Wrap (the program CPIs the deposit; a 5-account Wrap dies `0x6a`). `scripts/pay.mjs` does the paid call. Both read `~/jjj.json`.
 
 Unaudited. Holds an OpenRouter key, never user funds.

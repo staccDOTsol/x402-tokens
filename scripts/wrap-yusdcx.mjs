@@ -2,13 +2,17 @@
  * Wrap USDC into yUSDCx on mainnet. First wrap locks 1000 raw as min liquidity.
  *
  *   YUSDCX_AMOUNT=100000 node scripts/wrap-yusdcx.mjs   # 0.1 USDC
+ *
+ * Post-exploit 9-account Wrap: the program CPIs the deposit. Do not send a
+ * separate TransferChecked. Account 4 is Token-2022 (wrapped mint owner);
+ * account 8 is Tokenkeg (USDC / escrow owner). They are not interchangeable.
  */
 import {
   Connection, Keypair, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction, createTransferCheckedInstruction,
+  createAssociatedTokenAccountInstruction,
   getAccount, getMint,
 } from "@solana/spl-token";
 import { readFileSync } from "node:fs";
@@ -37,6 +41,10 @@ const ixWrap = (amount, bump) => new TransactionInstruction({
     { pubkey: userY, isSigner: false, isWritable: true },
     { pubkey: authority, isSigner: false, isWritable: false },
     { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: userUsdc, isSigner: false, isWritable: true },
+    { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+    { pubkey: USDC, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
   ],
   data: Buffer.concat([Buffer.from([1]), u64le(amount), Buffer.from([bump])]),
 });
@@ -57,10 +65,7 @@ try {
 } catch {
   tx.add(createAssociatedTokenAccountInstruction(payer.publicKey, userY, payer.publicKey, Y, TOKEN_2022_PROGRAM_ID));
 }
-tx.add(
-  createTransferCheckedInstruction(userUsdc, USDC, ESCROW, payer.publicKey, AMOUNT, 6, [], TOKEN_PROGRAM_ID),
-  ixWrap(AMOUNT, bump),
-);
+tx.add(ixWrap(AMOUNT, bump));
 const sig = await sendAndConfirmTransaction(conn, tx, [payer]);
 const y = await getAccount(conn, userY, "confirmed", TOKEN_2022_PROGRAM_ID);
 const supply = await getMint(conn, Y, "confirmed", TOKEN_2022_PROGRAM_ID);

@@ -1,4 +1,5 @@
 import type { Config } from "./config.js";
+import { wrapClientInstructions } from "./wrapspec.js";
 
 const esc = (x: unknown) =>
   String(x).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c] as string));
@@ -81,11 +82,14 @@ they are NOT the same across rails:
 
 ${hasSvm ? `IF THE ROW YOU PICKED IS A SOLANA ROW — build one legacy Transaction:
 1. feePayer = the row's extra.feePayer (${cfg.feePayer}) ← you do not pay SOL.
-2. exactly one Token-2022 TransferChecked: your ATA of the chosen mint → payTo's
-   ATA, amount = maxAmountRequired (raw, as given),
-   decimals = the row's extra.decimals ← read it off the row, do not hardcode
-3. you sign as the token owner. leave the feePayer signature empty.
-4. serialize requireAllSignatures=false, base64 those bytes
+2. if you hold raw USDC/TOKEN, prepend the 9-account Wrap in extra.acquire.steps
+   (the program CPIs the deposit; do not add a TransferChecked to escrow).
+3. exactly one Token-2022 TransferChecked of the SETTLEMENT mint: your ATA of
+   the chosen accepts[].asset → payTo's ATA, amount = maxAmountRequired (raw,
+   as given), decimals = the row's extra.decimals ← read it off the row, do not
+   hardcode. This is the payment, not the wrap.
+4. you sign as the token owner. leave the feePayer signature empty.
+5. serialize requireAllSignatures=false, base64 those bytes
 
 X-PAYMENT header = base64 of this JSON (utf8):
 {"x402Version":1,"scheme":"exact","network":"<the row's network>","payload":{"transaction":"<base64-tx>"}}
@@ -110,10 +114,7 @@ POST the SAME body again with X-PAYMENT set. Do not change model/messages/max_to
 
 On 200 you get a normal chat.completion.
 
-ON SOLANA, raw TOKEN (EVULoNF4DeMBN4dGiZiDfpiiTfNZgoCvXWWgaV3epump) and raw USDC will not settle. Wrap first:
-- USDC → yUSDCx via FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE escrow 2qLm8aCvn6gQVUFeQ7EC5J62Y95gFzc3vReHzD5d5Gj2
-- TOKEN → wTOKENx via the same program, escrow 7j682FdwSdTkXNjbMrrLd5wcXQoh23UTZaDReqKXbL2q
-Both wraps are Token-2022 with a 20bps transfer tax. Yield is that tax.
+${wrapClientInstructions()}
 
 ON BASE there is no wrap step — the row is native Circle USDC, held directly.
 ON ROBINHOOD CHAIN the row is wUSDGx, an ERC-4626 wrapper over Paxos USDG
@@ -263,7 +264,7 @@ footer{color:var(--dim);font-size:.85rem}
   <section class=prove>
     <div class=kicker>prompt your clanker</div>
     <h2>Dump this into Claude / Grok / Codex. It has everything.</h2>
-    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No provider key. If it can POST and sign — a Solana <code>TransferChecked</code>, or an <code>EIP-3009</code> authorization on Base or Robinhood Chain — it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
+    <p class=lede style="margin-top:.4rem;font-size:var(--0)">No SDK. No provider key. If it can POST and sign — a Solana 9-account <code>Wrap</code> (when you hold raw USDC/TOKEN) plus a <code>TransferChecked</code> of the settlement mint, or an <code>EIP-3009</code> authorization on Base or Robinhood Chain — it can buy inference here. Raw prompt also at <a href="/prompt.txt"><code>/prompt.txt</code></a>.</p>
     <div class=row>
       <button id=copyclanker type=button>copy prompt</button>
     </div>
@@ -308,7 +309,7 @@ GET  /v1/videos/{id}          # free to poll — the render was paid for at subm
     <div class=kicker>for degenerates</div>
     <ol>
       <li><strong>Pick ONE row</strong> from <code>accepts[]</code>. Every row carries its own network, asset, <code>payTo</code> and <code>decimals</code> — read them off the row, they differ per rail.</li>
-      <li><strong>Solana rows:</strong> fund with USDC or TOKEN, then pay via the row's settlement mint (raw USDC/TOKEN will not settle — the 402 and <a href="${esc(cfg.facilitator)}/start">${esc(cfg.facilitator)}/start</a> spell out the deposit step). One <code>TransferChecked</code> of <code>maxAmountRequired</code>; the fee payer is sponsored, you need no SOL.</li>
+      <li><strong>Solana rows:</strong> fund with USDC or TOKEN, then wrap via the 9-account <code>Wrap</code> on <code>FrSERTNCPvTtaDS9AvQp9u1nYGzXDb3kC9MdL8Xxn2NE</code> (the 402 <code>extra.acquire.steps</code> is the recipe — the program CPIs the deposit; a 5-account Wrap dies <code>0x6a</code>). Then one <code>TransferChecked</code> of <code>maxAmountRequired</code> of the wrapped mint to <code>payTo</code>. The fee payer is sponsored, you need no SOL.</li>
       <li><strong>Base / Robinhood Chain rows:</strong> no transaction at all — EIP-712-sign an EIP-3009 <code>TransferWithAuthorization</code> and the facilitator relays it and pays the gas. Base takes native Circle USDC directly; Robinhood Chain settles USDG (deposit path at <a href="${esc(cfg.facilitator)}/start">/start</a>).</li>
       <li><strong>POST the same body again</strong> with header <code>X-PAYMENT</code> = base64 of the x402 payload for your rail. On 200 you get a normal OpenRouter chat completion. The key never leaves this host.</li>
     </ol>
