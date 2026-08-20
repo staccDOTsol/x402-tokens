@@ -398,7 +398,7 @@ export function racePartConsumed(
   return result.launched.includes(p.model) && !result.failed.includes(p.model) && !result.aborted.includes(p.model);
 }
 
-/** USD actually consumed from a race ceiling, for the unused-credit refund. */
+/** USD of used racers from a race ceiling (info only — unused is not refunded). */
 export function raceActualUsd(
   parts: Array<{ model: string; q: Quote; role: "racer" | "judge" }>,
   result: RaceResult,
@@ -407,9 +407,9 @@ export function raceActualUsd(
 }
 
 /** Upstream cost of the racers (and judge) that actually ran — never the
- *  prepaid N+judge quote ceiling. That ceiling is what we settle; this is
- *  what we spent. Painting the ceiling as cogsUsd makes every unused-racer
- *  refund look like COGS > paid. */
+ *  prepaid N+judge quote ceiling. That ceiling is what we settle and keep;
+ *  this is what we spent. Ember when cogs > billed — do not "fix" it by
+ *  refunding the user. */
 export function raceActualCogsUsd(
   parts: Array<{ model: string; q: Quote; role: "racer" | "judge" }>,
   result: RaceResult,

@@ -673,14 +673,11 @@ export function createServerFor(cfg: Config) {
             resolution: normalizeResolution(payload.resolution),
           });
 
-      // Paid, then the upstream failed: credit it back in full. Same contract
-      // as the text lane — we cannot un-settle on chain, so the tenant carries
-      // the balance forward instead of eating our outage.
+      // Settled, then the upstream failed: keep the money. We still pay
+      // Together. Do not grant credit back for a launched / settled call.
       if (out.status < 200 || out.status >= 300) {
-        if (q.billedUsd > 0) {
-          grantCredit(tenantKey, q.billedUsd, `${kind} upstream ${out.status}`);
-        }
-        evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: true });
+        if (q.billedUsd > 0) recordSpend(tenantKey, q.billedUsd, cfg.volumeWindowDays);
+        evt("upstream_error", { upstream: out.status, billedUsd: q.billedUsd, credited: false });
         return json(res, out.status, out.json);
       }
       // Media spend counts toward the text lane's volume curve. It is real
@@ -699,9 +696,8 @@ export function createServerFor(cfg: Config) {
     // PREPAY. Settling on-chain per call is where the latency actually lives:
     // this gateway answers its 402 challenge in ~0.12s, while a full paid call
     // MEASURED 9-37s end to end, almost all of it the payment round trip.
-    // Credit is already spent automatically wherever a quote is priced, but
-    // nothing could ever ADD credit except an error refund. Buying it in one
-    // settlement lets every later call skip verify+settle entirely.
+    // Credit is already spent automatically wherever a quote is priced.
+    // Buying it in one settlement lets every later call skip verify+settle.
     /**
      * Exchange a namespace signature for a 24h session token.
      *
@@ -1148,10 +1144,9 @@ export function createServerFor(cfg: Config) {
         ...extra,
       });
       const header = req.headers["x-payment"] as string | undefined;
-      // PROVIDER-ERROR CREDITS: settle-first means an upstream error is money
-      // already taken (measured: $0.088 settled for an xAI auth-error body).
-      // Those amounts become tenant credit; a quote fully covered by credit
-      // serves WITHOUT payment. Optimistic consumption — see credits.ts.
+      // Prepaid credit covers a quote without a wallet 402. Once we draw it
+      // (or settle on-chain) we keep the money even if upstream then errors —
+      // we still pay OpenRouter. Optimistic consumption — see credits.ts.
       // (tenantKey is resolved above the quote — the price depends on it.)
       let paidByCredit = false;
       let paidBySub = false;
@@ -1254,7 +1249,7 @@ export function createServerFor(cfg: Config) {
         });
         return;
       }
-      // JSON and SSE share one billing path (refunds, reconcile, honest cogs).
+      // JSON and SSE share one billing path (keep prepaid, honest cogs).
       spillHud.noteQuote({ directUsd: q.directUsd, spentUsd: q.billedUsd });
       await serveSingle(res, {
         cfg,
