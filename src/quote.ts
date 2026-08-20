@@ -484,7 +484,7 @@ async function applyLiveSpots(cfg: Config, q: Quote): Promise<Quote> {
 
 export async function quoteLive(
   cfg: Config,
-  body: { model?: string; messages?: unknown; max_tokens?: number },
+  body: { model?: string; messages?: unknown; max_tokens?: number; plugins?: unknown },
   counterfactualTokens?: number,
   tenantSpendUsd = 0,
 ): Promise<Quote> {
@@ -494,4 +494,57 @@ export async function quoteLive(
 /** Media equivalent of quoteLive: flat upstream cost in, fully-priced 402 out. */
 export async function quoteMediaLive(cfg: Config, modelId: string, upstreamUsd: number, priceModel: string, markup?: number): Promise<Quote> {
   return applyLiveSpots(cfg, quoteUnits(cfg, modelId, upstreamUsd, priceModel, markup));
+}
+
+/**
+ * One Quote for a race ceiling: N racer quotes + an optional judge, with
+ * accepts[] rebuilt at the SUM. The completions handler settles this once.
+ */
+export function mergeQuotes(cfg: Config, quotes: Quote[], modelId: string): Quote {
+  if (!quotes.length) throw new Error("mergeQuotes: no parts");
+  const billedUsd = quotes.reduce((s, q) => s + q.billedUsd, 0);
+  const openrouterUsd = quotes.reduce((s, q) => s + q.openrouterUsd, 0);
+  const directUsd = quotes.reduce((s, q) => s + (q.directUsd ?? q.openrouterUsd), 0);
+  const promptTokensEst = quotes.reduce((s, q) => s + q.promptTokensEst, 0);
+  const maxOut = quotes.reduce((s, q) => s + q.maxOut, 0);
+  const pricedAt = new Date().toISOString();
+  const accepts: QuoteLine[] = [];
+  for (const a of cfg.assets) {
+    const template = quotes[0].accepts.find((l) => l.mint === a.mint);
+    const tokenUsd = template?.tokenUsd ?? a.stableUsd ?? 1;
+    const net = usdToRaw(billedUsd, tokenUsd, a.decimals);
+    accepts.push({
+      symbol: a.symbol,
+      mint: a.mint,
+      network: a.network ?? cfg.network,
+      decimals: a.decimals,
+      tokenUsd,
+      billedUsd,
+      netRaw: net.toString(),
+      grossRaw: grossUp(net, a.feeBps).toString(),
+      feeBps: a.feeBps,
+      pricedAt,
+      payTo: a.payTo,
+      eip712: a.eip712,
+      priceStale: template?.priceStale,
+    });
+  }
+  return {
+    model: modelId,
+    promptTokensEst,
+    maxOut,
+    openrouterUsd,
+    markup: openrouterUsd > 0 ? billedUsd / openrouterUsd : 1,
+    billedUsd,
+    pricedAt,
+    accepts,
+    pricing: quotes.some((q) => q.pricing === "counterfactual") ? "counterfactual" : "volume",
+    directUsd,
+    savesVsDirect: billedUsd > 0 ? directUsd / billedUsd : 1,
+    rate: directUsd > 0 ? Math.min(1, billedUsd / directUsd) : 1,
+    savedPct: directUsd > 0 ? Math.max(0, 1 - billedUsd / directUsd) : 0,
+    savedUsd: Math.max(0, directUsd - billedUsd),
+    volume: quotes[0].volume,
+    flooredAtCost: quotes.some((q) => q.flooredAtCost),
+  };
 }
