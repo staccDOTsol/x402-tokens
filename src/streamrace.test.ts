@@ -204,11 +204,14 @@ grantCredit("zoo", 50, "test");
       stream: false, race: 4, race_need: 2, tier: "cheap",
     }),
   });
-  const j = await r.json() as { choices?: unknown[]; x402?: { credit?: unknown; billedUsd?: number } };
+  const j = await r.json() as { choices?: unknown[]; x402?: { credit?: unknown; billedUsd?: number; refund_credit?: unknown } };
   ok(r.status === 200, "credit-covered race → 200");
   ok(Array.isArray(j.choices), "credit race returns a completion");
   const applied = creditEntries("zoo").filter((e) => e.reason === "applied").length - appliedBefore;
   ok(applied === 1, `credit applied once, not per racer (got ${applied})`);
+  ok(!j.x402?.refund_credit, "failed / unused racers do not restore prepaid");
+  ok(!creditEntries("zoo").some((e) => e.reason === "race_unused" || e.reason === "provider_error"),
+    "ledger has no race_unused / provider_error grant-back");
   ok(settleCount === 0, "no x402 settle on the credit path");
   const racerCalls = (upstreamByModel.m1 || 0) + (upstreamByModel.m2 || 0) + (upstreamByModel.m3 || 0) + (upstreamByModel.m4 || 0);
   ok(racerCalls >= 3, `several racers launched (${racerCalls}) but billed once`);

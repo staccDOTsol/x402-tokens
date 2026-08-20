@@ -17,7 +17,6 @@ import {
   pairwisePrompt, raceReconcile, RACE_EVERY_FAILED, RACE_FAILED_CODE,
   type RaceArrival, type RaceQuote, type RaceResult, type RaceSpec,
 } from "./race.js";
-import { grantCredit } from "./credits.js";
 import { recordSpend } from "./spend.js";
 import { json } from "./httpjson.js";
 import { chatToAnthropicMessage } from "./spill.js";
@@ -37,7 +36,7 @@ export interface ReceiptExtras {
   dedupStripped?: number;
   pay: PayInfo;
   spill?: { sent: number; total: number; context_id?: string };
-  /** Reconciled customer price. Quote is a ceiling; this is what we keep. */
+  /** What the user paid (prepaid quote, never above direct). */
   billedUsd?: number;
   /** Upstream cost of work that actually ran — never the N+judge quote. */
   cogsUsd?: number;
@@ -146,33 +145,28 @@ export async function runOneModel(
 }
 
 /**
- * Grant prepaid quote back onto tenant credit. Subscription skip-402 never
- * drew a wallet or local credit, so it is the only path that skips.
+ * After a 402 settle, a prepaid draw, or a launched racer we keep the money.
+ * OpenRouter still bills us for in-flight / settled work — unused racers,
+ * 502/503/timeout, and lost races are not grant-backs. Subscription skip-402
+ * never minted credit and still does not.
  *
- * paidByCredit USED to be excluded (`!paidByCredit && !paidBySub`): a 502
- * after applyCredit ate the prepaid balance and never wrote it back. Refund
- * unconditionally — including prepaid credit — for provider errors and for
- * unused ceiling. The unused-racer grant-back (race_unused) stays.
+ * Only a call that never left the house (didn't start) skips charging, and
+ * that path never reaches here.
  */
 export function refundAfterSettle(
-  tenantKey: string,
-  paidBySub: boolean | undefined,
-  quotedUsd: number,
-  actualUsd: number,
-  failed: boolean,
-  reasons: { failed: string; unused: string } = { failed: "race_failed", unused: "race_unused" },
+  _tenantKey: string,
+  _paidBySub: boolean | undefined,
+  _quotedUsd: number,
+  _actualUsd: number,
+  _failed: boolean,
+  _reasons: { failed: string; unused: string } = { failed: "race_failed", unused: "race_unused" },
 ): { refundUsd: number; refundReason: string } | undefined {
-  if (paidBySub || quotedUsd <= 0) return undefined;
-  if (failed) {
-    grantCredit(tenantKey, quotedUsd, reasons.failed);
-    return { refundUsd: quotedUsd, refundReason: reasons.failed };
-  }
-  const unused = Math.max(0, quotedUsd - actualUsd);
-  if (unused > 0) {
-    grantCredit(tenantKey, unused, reasons.unused);
-    return { refundUsd: unused, refundReason: reasons.unused };
-  }
   return undefined;
+}
+
+/** Prepaid quote, never above going-naked direct. Not a COGS refund. */
+export function prepaidBilledUsd(q: Quote): number {
+  return Math.min(Math.max(0, q.billedUsd), q.directUsd ?? q.billedUsd);
 }
 
 function asUpstreamError(e: unknown): CompleteResult {
@@ -234,33 +228,28 @@ export async function serveSingle(
     try {
       usage = await pipeSse(res, out.stream);
     } catch (e) {
-      const refund = refundAfterSettle(
-        tenantKey, extras.pay.paidBySub, q.billedUsd, 0, true,
-        { failed: "provider_error", unused: "reconcile" },
-      );
-      const receipt = x402Receipt({ ...extras, billedUsd: 0, cogsUsd: 0, ...refund });
+      const billedUsd = prepaidBilledUsd(q);
+      if (billedUsd > 0) recordSpend(tenantKey, billedUsd, args.cfg.volumeWindowDays);
+      const receipt = x402Receipt({ ...extras, billedUsd, cogsUsd: 0 });
       sseEvent(res, "error", { error: { message: (e as Error).message || "stream failed", code: "upstream_error" } });
       sseReceipt(res, receipt);
       sseDone(res);
       res.end();
       evt("paid_upstream_error", {
-        payer: extras.pay.payer, upstream: 502, billedUsd: 0, cogsUsd: 0,
+        payer: extras.pay.payer, upstream: 502, billedUsd, cogsUsd: 0,
         directUsd: q.directUsd, tx: extras.pay.settled.transaction,
       });
       return;
     }
     const rec = reconcileQuote(q, usage);
-    const refund = refundAfterSettle(
-      tenantKey, extras.pay.paidBySub, q.billedUsd, rec.billedUsd, false,
-      { failed: "provider_error", unused: "reconcile" },
-    );
-    if (rec.billedUsd > 0) recordSpend(tenantKey, rec.billedUsd, args.cfg.volumeWindowDays);
-    const receipt = x402Receipt({ ...extras, billedUsd: rec.billedUsd, cogsUsd: rec.cogsUsd, ...refund });
+    const billedUsd = prepaidBilledUsd(q);
+    if (billedUsd > 0) recordSpend(tenantKey, billedUsd, args.cfg.volumeWindowDays);
+    const receipt = x402Receipt({ ...extras, billedUsd, cogsUsd: rec.cogsUsd });
     sseReceipt(res, receipt);
     sseDone(res);
     res.end();
     evt("paid_200", {
-      payer: extras.pay.payer, upstream: out.status, billedUsd: rec.billedUsd,
+      payer: extras.pay.payer, upstream: out.status, billedUsd,
       cogsUsd: rec.cogsUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
     });
     return;
@@ -278,18 +267,18 @@ export async function serveSingle(
   }
 
   const errored = providerErrored(used.json) || used.status < 200 || used.status >= 300;
-  const rec = errored ? { billedUsd: 0, cogsUsd: 0, unusedUsd: q.billedUsd } : reconcileQuote(q, usageFromCompletion(used.json));
-  const refund = refundAfterSettle(
-    tenantKey, extras.pay.paidBySub, q.billedUsd, rec.billedUsd, errored,
-    { failed: "provider_error", unused: "reconcile" },
-  );
-  if (rec.billedUsd > 0 && !errored) {
-    recordSpend(tenantKey, rec.billedUsd, args.cfg.volumeWindowDays);
+  const rec = errored
+    ? { billedUsd: prepaidBilledUsd(q), cogsUsd: 0, unusedUsd: 0 }
+    : reconcileQuote(q, usageFromCompletion(used.json));
+  const billedUsd = prepaidBilledUsd(q);
+  const cogsUsd = rec.cogsUsd;
+  if (billedUsd > 0) {
+    recordSpend(tenantKey, billedUsd, args.cfg.volumeWindowDays);
   }
-  const receipt = x402Receipt({ ...extras, billedUsd: rec.billedUsd, cogsUsd: rec.cogsUsd, ...refund });
+  const receipt = x402Receipt({ ...extras, billedUsd, cogsUsd });
   evt(used.status >= 200 && used.status < 300 ? "paid_200" : "paid_upstream_error", {
-    payer: extras.pay.payer, upstream: used.status, billedUsd: rec.billedUsd,
-    cogsUsd: rec.cogsUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
+    payer: extras.pay.payer, upstream: used.status, billedUsd,
+    cogsUsd, directUsd: q.directUsd, tx: extras.pay.settled.transaction,
   });
 
   if (wantsStream) {
@@ -382,18 +371,16 @@ export async function serveRace(
     onStatus: wantsStream ? (s) => sseStatus(res, s) : undefined,
   });
 
-  const actual = result.error ? { billedUsd: 0, cogsUsd: 0 } : raceReconcile(raceQuote.parts, result, usageByModel);
-  // Unused-racer grant-back (race_unused) and all-fail (race_failed). Prepaid
-  // credit is refunded here too — do not skip paidByCredit.
-  const refund = refundAfterSettle(tenantKey, extras.pay.paidBySub, q.billedUsd, actual.billedUsd, !!result.error);
-  if (actual.billedUsd > 0 && !result.error) {
-    recordSpend(tenantKey, actual.billedUsd, args.cfg.volumeWindowDays);
+  const actual = raceReconcile(raceQuote.parts, result, usageByModel);
+  const billedUsd = prepaidBilledUsd(q);
+  const unusedUsd = Math.max(0, q.billedUsd - actual.billedUsd);
+  if (billedUsd > 0) {
+    recordSpend(tenantKey, billedUsd, args.cfg.volumeWindowDays);
   }
   const receipt = x402Receipt({
     ...extras,
-    billedUsd: actual.billedUsd,
+    billedUsd,
     cogsUsd: actual.cogsUsd,
-    ...refund,
     race: {
       n: race.n,
       need: race.need,
@@ -404,13 +391,13 @@ export async function serveRace(
       quotedUsd: q.billedUsd,
       actualUsd: actual.billedUsd,
       actualCogsUsd: actual.cogsUsd,
-      unusedUsd: refund?.refundUsd ?? 0,
+      unusedUsd,
     },
   });
 
   evt(result.error ? "paid_upstream_error" : "paid_200", {
     payer: extras.pay.payer,
-    billedUsd: actual.billedUsd,
+    billedUsd,
     cogsUsd: actual.cogsUsd,
     quotedUsd: q.billedUsd,
     race: true,

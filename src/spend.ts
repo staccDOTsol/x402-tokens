@@ -7,8 +7,7 @@
  * from that: the axis is the tenant (sha256(chain:signer:namespace), the same
  * key credits.ts partitions by), the window is 30 days, and a price that
  * silently changes because a ring rolled over is not a price. So this is a
- * small, durable, purpose-built ledger — modelled on credits.ts, which solves
- * the identical problem for error refunds.
+ * small, durable, purpose-built ledger — modelled on credits.ts.
  *
  * SHAPE. One append per settled call, folded on read into UTC-day buckets per
  * tenant. Day buckets rather than raw events because the memory then has a

@@ -1,7 +1,8 @@
 /**
- * Honest prepaid billing: refund provider errors (including paidByCredit),
- * quote is a ceiling, receipt cogsUsd is actual used work — never the
- * N+judge quote ceiling — and billedUsd is never above direct.
+ * Keep prepaid after a launched / settled call. Quote is a ceiling vs
+ * direct (never bill MORE than going naked). Receipt cogsUsd is actual
+ * provider cost. billedUsd is what the user paid. Do not grant credit
+ * back for race_unused or provider_error — we still pay OpenRouter.
  */
 import { createServer } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -23,8 +24,8 @@ const ok = (c: boolean, m: string) => { if (!c) { console.error("FAIL", m); proc
 import type { Quote } from "./quote.js";
 import { reconcileQuote, usageFromCompletion } from "./quote.js";
 import { raceActualCogsUsd, raceActualUsd, racePartConsumed, raceReconcile, type RaceResult } from "./race.js";
-import { refundAfterSettle, x402Receipt, type PayInfo } from "./completions.js";
-import { creditEntries, grantCredit, _resetCredits } from "./credits.js";
+import { prepaidBilledUsd, refundAfterSettle, x402Receipt, type PayInfo } from "./completions.js";
+import { creditBalance, creditEntries, grantCredit, _resetCredits } from "./credits.js";
 
 function q(partial: Partial<Quote> & { billedUsd: number; openrouterUsd: number }): Quote {
   return {
@@ -73,16 +74,16 @@ const ceilingCogs = parts.reduce((s, p) => s + p.q.openrouterUsd, 0);
 const used = raceResult();
 
 /* ---------------------------------------------------------------------- *
- * Unit: prepaid error refunds include paidByCredit.
+ * Unit: after settle / launch, never grant race_unused or provider_error.
  * ---------------------------------------------------------------------- */
-console.log("--- prepaid error refunds ---");
+console.log("--- no grant-back after settle ---");
 _resetCredits();
 writeFileSync(process.env.CREDITS_PATH as string, "");
 {
   const r = refundAfterSettle("t", false, 0.42, 0, true, { failed: "provider_error", unused: "reconcile" });
-  ok(!!r && r.refundReason === "provider_error" && r.refundUsd === 0.42, "provider_error refunds the prepaid quote");
-  ok(creditEntries("t").some((e) => e.reason === "provider_error" && e.usd === 0.42),
-    "ledger writes provider_error even when the caller prepaid with credit");
+  ok(r === undefined, "provider_error after a launched call does not refund");
+  ok(!creditEntries("t").some((e) => e.reason === "provider_error"),
+    "ledger does not write provider_error for prepaid / paidByCredit");
 }
 {
   const before = creditEntries("t").length;
@@ -92,8 +93,15 @@ writeFileSync(process.env.CREDITS_PATH as string, "");
 }
 {
   const r = refundAfterSettle("t", false, 1, 0.25, false);
-  ok(!!r && r.refundReason === "race_unused" && Math.abs(r.refundUsd - 0.75) < 1e-12,
-    "unused-racer grant-back (race_unused) is kept");
+  ok(r === undefined, "unused racers / unused ceiling are not granted back");
+  ok(!creditEntries("t").some((e) => e.reason === "race_unused"),
+    "ledger does not write race_unused");
+}
+{
+  const quoted = q({ billedUsd: 0.10, openrouterUsd: 0.12, directUsd: 0.10 });
+  ok(Math.abs(prepaidBilledUsd(quoted) - 0.10) < 1e-12, "prepaid billed stays at the quote");
+  const leaked = q({ billedUsd: 0.08, openrouterUsd: 0.05, directUsd: 0.05 });
+  ok(Math.abs(prepaidBilledUsd(leaked) - 0.05) < 1e-12, "billed is still a ceiling vs direct");
 }
 
 /* ---------------------------------------------------------------------- *
@@ -114,7 +122,7 @@ const receipt = x402Receipt({
   q: q({ billedUsd: 0.23, openrouterUsd: ceilingCogs, directUsd: 0.23 }),
   lecoreInfo: { engaged: false, tokensBefore: 1, tokensAfter: 1 },
   pay: pay(),
-  billedUsd: actualBill,
+  billedUsd: 0.23,
   cogsUsd: actualCogs,
   race: {
     n: 4, need: 2, tier: "cheap", models: ["m1", "m2", "m3", "m4"],
@@ -123,18 +131,22 @@ const receipt = x402Receipt({
 });
 ok(receipt.cogsUsd === actualCogs, "receipt cogsUsd === used actual, not q.openrouterUsd");
 ok(receipt.cogsUsd !== ceilingCogs, "receipt cogsUsd is not the N+judge ceiling");
+ok((receipt.billedUsd as number) === 0.23, "receipt billedUsd stays at what the user paid");
 ok((receipt.billedUsd as number) <= (receipt.directUsd as number) + 1e-12, "receipt billedUsd <= directUsd");
+ok(!receipt.refund_credit, "receipt has no refund_credit when we keep prepaid");
 
 const painted = x402Receipt({
   q: q({ billedUsd: 0.23, openrouterUsd: ceilingCogs, directUsd: 0.23 }),
   lecoreInfo: { engaged: false, tokensBefore: 1, tokensAfter: 1 },
   pay: pay(),
+  billedUsd: 0.23,
   race: {
     n: 4, need: 2, tier: "cheap", models: ["m1", "m2", "m3", "m4"],
     quotedUsd: 0.23, actualUsd: actualBill, actualCogsUsd: actualCogs, unusedUsd: 0.11,
   },
 });
 ok(painted.cogsUsd === actualCogs, "even without extras.cogsUsd, race.actualCogsUsd wins over the ceiling");
+ok((painted.billedUsd as number) === 0.23, "billed stays prepaid even when race.actualUsd is lower");
 
 /* ---------------------------------------------------------------------- *
  * Unit: quote is a ceiling; reconcile never bills above direct.
@@ -154,7 +166,7 @@ console.log("--- quote is a ceiling ---");
   ok(rec.billedUsd <= quoted.billedUsd + 1e-12, "reconcile never bills above the prepaid quote");
   ok(rec.billedUsd <= (quoted.directUsd ?? 0) + 1e-12, "reconcile never bills above direct");
   ok(rec.cogsUsd === 0.02, "cogsUsd is usage.cost, not the max_tokens ceiling");
-  ok(rec.billedUsd < quoted.billedUsd, "emitting less than max_tokens lowers the bill");
+  ok(rec.billedUsd < quoted.billedUsd, "emitting less than max_tokens lowers the reconciled bill");
 }
 {
   const quoted = q({ billedUsd: 0.08, openrouterUsd: 0.05, directUsd: 0.05 });
@@ -286,22 +298,31 @@ function resetLedger() {
   _clearModelCache();
 }
 
-// Prepaid 502 / 503 / fetch-failed refund the applied credit in full.
+function refundReasons(tenant: string) {
+  return creditEntries(tenant).filter((e) =>
+    e.reason === "provider_error" || e.reason === "race_unused" || e.reason === "race_failed" || e.reason === "reconcile",
+  );
+}
+
+// Prepaid 502 / 503 / fetch-failed: we launched upstream, so keep the draw.
 for (const errMode of ["502", "503", "fetchfail"] as const) {
   resetLedger();
   grantCredit("zoo", 5, "seed");
   mode = errMode;
   const r = await chat({ model: "m", messages: [{ role: "user", content: "ping" }], max_tokens: 32 });
-  const j = await r.json() as { x402?: { refund_credit?: { usd?: number; reason?: string }; billedUsd?: number; cogsUsd?: number } };
+  const j = await r.json() as {
+    x402?: { refund_credit?: { usd?: number; reason?: string }; billedUsd?: number; cogsUsd?: number; quotedUsd?: number };
+  };
   ok(r.status >= 400, `${errMode}: prepaid error is not a 200`);
-  ok(j.x402?.refund_credit?.reason === "provider_error", `${errMode}: refund_credit.reason is provider_error (paidByCredit)`);
-  ok((j.x402?.refund_credit?.usd ?? 0) > 0, `${errMode}: refund_credit.usd is the prepaid quote`);
-  ok((j.x402?.billedUsd ?? 1) === 0, `${errMode}: billedUsd is 0 after a provider error`);
-  ok((j.x402?.cogsUsd ?? 1) === 0, `${errMode}: cogsUsd is 0 after a provider error`);
+  ok(!j.x402?.refund_credit, `${errMode}: no refund_credit after a launched call`);
+  ok((j.x402?.billedUsd ?? 0) > 0, `${errMode}: billedUsd stays at what the user paid`);
+  ok(Math.abs((j.x402?.billedUsd ?? 0) - (j.x402?.quotedUsd ?? 1)) < 1e-12,
+    `${errMode}: billed stays at the prepaid quote`);
+  ok((j.x402?.cogsUsd ?? 1) === 0, `${errMode}: cogsUsd is actual (no usage.cost on a provider error)`);
   const applied = creditEntries("zoo").filter((e) => e.reason === "applied").reduce((s, e) => s + e.usd, 0);
-  const refunded = creditEntries("zoo").filter((e) => e.reason === "provider_error").reduce((s, e) => s + e.usd, 0);
-  ok(applied < 0 && Math.abs(applied + refunded) < 1e-9,
-    `${errMode}: applied prepaid credit is granted back (applied=${applied} refunded=${refunded})`);
+  ok(applied < 0, `${errMode}: prepaid credit was drawn (applied=${applied})`);
+  ok(refundReasons("zoo").length === 0, `${errMode}: drawn prepaid is not granted back`);
+  ok(creditBalance("zoo") < 5 - 1e-12, `${errMode}: balance stays reduced`);
 }
 
 // Successful JSON: billed ≤ direct, cogs is usage.cost not the max_tokens ceiling.
@@ -315,13 +336,16 @@ mode = "ok";
   ok((j.x402?.billedUsd ?? 9) <= (j.x402?.directUsd ?? 0) + 1e-12, "billedUsd ≤ directUsd");
   ok((j.x402?.cogsUsd ?? 9) === 0.00001, "cogsUsd is usage.cost, not the max_tokens quote");
   ok((j.x402?.billedUsd ?? 9) <= (j.x402?.quotedUsd ?? 0) + 1e-12, "billedUsd ≤ quoted ceiling");
+  ok(Math.abs((j.x402?.billedUsd ?? 0) - (j.x402?.quotedUsd ?? 1)) < 1e-12,
+    "success billed stays at prepaid (unused tokens are not granted back)");
 }
 
-// Race: cogsUsd is used racers, not the N+judge ceiling. Unused grant-back stays.
+// 4-need-2 race with 2 failures: do NOT restore prepaid. billed stays. cogs is actual.
 resetLedger();
 grantCredit("zoo", 50, "seed");
 mode = "race";
 {
+  const before = creditBalance("zoo");
   const r = await chat({
     messages: [{ role: "user", content: "ping" }], max_tokens: 32,
     race: 4, race_need: 2, tier: "cheap",
@@ -333,15 +357,18 @@ mode = "race";
       race?: { actualUsd?: number; actualCogsUsd?: number; unusedUsd?: number; quotedUsd?: number };
     };
   };
-  ok(r.status === 200, "prepaid race → 200");
+  ok(r.status === 200, "prepaid 4-need-2 race → 200");
   const x = j.x402!;
   ok(x.cogsUsd === x.race?.actualCogsUsd, "receipt cogsUsd === race.actualCogsUsd");
-  ok((x.race?.unusedUsd ?? 0) > 0, "unused-racer grant-back still fires");
-  ok(x.refund_credit?.reason === "race_unused", "refund reason stays race_unused");
-  ok((x.cogsUsd ?? 9) < (x.quotedUsd ?? 0), "cogsUsd is below the prepaid N+judge ceiling");
-  ok((x.billedUsd ?? 9) <= (x.quotedUsd ?? 0) + 1e-12, "race billedUsd ≤ quoted ceiling");
+  ok(!x.refund_credit, "4-need-2 with failures does not write refund_credit");
+  ok(refundReasons("zoo").length === 0, "2 failures do not restore prepaid (no race_unused / provider_error)");
+  ok(Math.abs((x.billedUsd ?? 0) - (x.quotedUsd ?? 1)) < 1e-12, "billed stays at the prepaid N+judge quote");
   ok((x.billedUsd ?? 9) <= (x.directUsd ?? 0) + 1e-12, "race billedUsd ≤ directUsd");
+  ok((x.cogsUsd ?? 9) < (x.quotedUsd ?? 0), "cogsUsd is below the prepaid N+judge ceiling");
   ok(Math.abs((x.cogsUsd ?? 9) - 0.000025) < 1e-12, `cogsUsd is used racers' usage.cost (m2+m3+judge=0.000025, got ${x.cogsUsd})`);
+  const applied = creditEntries("zoo").filter((e) => e.reason === "applied").reduce((s, e) => s + e.usd, 0);
+  ok(applied < 0, `prepaid was drawn once for the race (applied=${applied})`);
+  ok(creditBalance("zoo") < before - 1e-12, "unused / failed racers do not restore the drawn balance");
 }
 
 // x-ai/* meters through OpenRouter, not the direct-xAI URL.

@@ -1,18 +1,14 @@
 /**
- * Provider-error credits.
+ * Prepaid tenant credit (top-ups). Not an error-refund ledger.
  *
- * Settle-before-serve is deliberate (see server.ts: failed settles used to be
- * free inference), which means a call whose UPSTREAM then errors has already
- * been paid for. MEASURED (2026-08-15): xAI rejected the upstream key and the
- * gateway settled $0.088 on-chain for an error JSON — grok bought ~$1 of
- * "Incorrect API key" that day.
+ * A quote fully covered by balance serves without a wallet 402. Consumption
+ * is optimistic — a caller who abandons the quote wastes their own credit
+ * rather than double-spending it. Once we draw prepaid (or settle on-chain)
+ * and launch upstream, we keep the money: we still pay OpenRouter for
+ * in-flight / settled work. Subscription skip-402 never mints credit here.
  *
- * We cannot un-settle, and on-chain refunds are their own project. What we can
- * do tonight, honestly: credit the tenant the full billed amount and apply it
- * automatically to their next quotes until consumed. Keyed by tenant (same key
- * the sidecar partitions by), because at quote time no payer address exists
- * yet — the common case (same client retries immediately) is exactly the case
- * this serves. Durable jsonl so restarts do not eat anyone's credit.
+ * Keyed by tenant (same key the sidecar partitions by). Durable jsonl so
+ * restarts do not eat anyone's balance.
  */
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 
@@ -48,7 +44,7 @@ export function creditBalance(tenant: string): number {
   return Math.max(0, load().get(tenant) ?? 0);
 }
 
-/** Upstream returned an error object after we settled: full billed amount back. */
+/** Add prepaid balance (top-up). Never used to refund a launched / settled call. */
 export function grantCredit(tenant: string, usd: number, reason: string): void {
   if (usd <= 0) return;
   write({ tenant, usd, reason, t: Date.now() });
@@ -58,7 +54,7 @@ export function grantCredit(tenant: string, usd: number, reason: string): void {
  * Apply available credit to a quote. Returns the discounted amount and
  * RECORDS the consumption immediately — optimistic, so a caller who abandons
  * the quote wastes their own credit rather than double-spending it. Credits
- * exist to make error responses free, not to be a bank.
+ * exist so a tenant can skip the per-call 402, not to refund OpenRouter COGS.
  */
 export function applyCredit(tenant: string, billedUsd: number): { usd: number; creditUsed: number } {
   const bal = creditBalance(tenant);
